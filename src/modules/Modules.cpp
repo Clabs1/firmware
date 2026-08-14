@@ -4,6 +4,7 @@
 #include "modules/SystemCommandsModule.h"
 #endif
 #include "modules/StatusLEDModule.h"
+#include "modules/FamilyTrackerModule.h"
 #if !MESHTASTIC_EXCLUDE_REPLYBOT
 #include "ReplyBotModule.h"
 #endif
@@ -189,6 +190,12 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_STATUS
     statusMessageModule = new StatusMessageModule();
+#endif
+#if !MESHTASTIC_EXCLUDE_PANIC
+    familyTrackerModule = new FamilyTrackerModule(); // dual-role family tracker (child panic + parent watchdog)
+    // LTO guard: force a real read of the global so whole-image LTO cannot elide the
+    // construction above (which self-registers into MeshModule::modules + OSThread).
+    asm volatile("" : : "r"(familyTrackerModule) : "memory");
 #endif
 #if !MESHTASTIC_EXCLUDE_GENERIC_THREAD_MODULE
     new GenericThreadModule();
