@@ -746,6 +746,23 @@ void NodeDB::resetRadioConfig(bool is_fresh_install)
         if (owner.is_licensed)
             channels.ensureLicensedOperation();
     }
+#ifdef USERPREFS_FORCE_FAMILY_CHANNEL
+    else if (USERPREFS_FORCE_FAMILY_CHANNEL == 1) {
+        // Force the baked family channel on every boot (not just fresh install): a node
+        // reflashed with our Family Tracker firmware must come up on the private 'family'
+        // channel as PRIMARY even if it previously held stale channels (e.g. from stock
+        // firmware or a different group). Wipe all slots, then re-init the baked defaults.
+        LOG_WARN("FamilyTracker: forcing baked family channel over stored config");
+        for (int i = 0; i < MAX_NUM_CHANNELS; i++) {
+            meshtastic_Channel &ch = channels.getByIndex((ChannelIndex)i);
+            ch.has_settings = false; // fixupChannel() will DISABLE slots without settings
+            ch.role = meshtastic_Channel_Role_DISABLED;
+        }
+        channels.initDefaults();
+        if (owner.is_licensed)
+            channels.ensureLicensedOperation();
+    }
+#endif
 
     channels.onConfigChanged();
 
