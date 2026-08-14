@@ -51,12 +51,14 @@ uint16_t getVDDVoltage();
 
 // Weak empty variant shutdown prep function.
 // May be redefined by variant files.
-void variant_shutdown() __attribute__((weak));
-void variant_shutdown() {}
+// noinline: same reason as variant_enableBatteryLpcompWake() below -- weak default and call
+// site are in this file, so LTO would inline the empty body and drop the variant's override.
+__attribute__((noinline)) void variant_shutdown() __attribute__((weak));
+__attribute__((noinline)) void variant_shutdown() {}
 
 // Optional variant hook called each nrf52Loop(); e.g. for low-VDD System OFF.
-void variant_nrf52LoopHook(void) __attribute__((weak));
-void variant_nrf52LoopHook(void) {}
+__attribute__((noinline)) void variant_nrf52LoopHook(void) __attribute__((weak));
+__attribute__((noinline)) void variant_nrf52LoopHook(void) {}
 
 // Return false to skip LPCOMP wake when entering System OFF (e.g. user CLI shutdown).
 // noinline: weak default and call site are in this file; without it GCC may inline the
@@ -171,7 +173,11 @@ bool loopCanSleep()
 {
     // turn off sleep only while connected via USB
     // return true;
+#ifdef MESHTASTIC_TEST_NO_SLEEP
+    return false;   // TEST: keep CPU awake so USB console stays responsive
+#else
     return !Serial; // the bool operator on the nrf52 serial class returns true if connected to a PC currently
+#endif
     // return !(TinyUSBDevice.mounted() && !TinyUSBDevice.suspended());
 }
 
