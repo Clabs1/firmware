@@ -399,6 +399,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         if (isChild()) {
             LOG_INFO("FamilyTracker: PANIC_TRIGGER from 0x%08x -> panic", mp.from);
             uint32_t pe = nextEventId++;
+            lastPanicEventId = pe; // so the returning ACK matches (SPEC §34)
             sendMessage(FAMILYTRACKER_MSG_PANIC, pe, true, false, 0);
             char timeStr[8] = "--:--";
             uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, true); // already local (TZ applied)
@@ -466,6 +467,7 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
         case INPUT_BROKER_ALT_PRESS:
             if (isChild()) {
                 uint32_t eventId = nextEventId++;
+                lastPanicEventId = eventId; // so the returning ACK matches (SPEC §34)
                 sendMessage(FAMILYTRACKER_MSG_PANIC, eventId, true, false, 0);
                 char timeStr[8] = "--:--";
                 uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, true); // already local (TZ applied)
