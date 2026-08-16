@@ -160,12 +160,12 @@ void FamilyTrackerModule::renderPanicAlert(const meshtastic_MeshPacket &mp, uint
             snprintf(distStr, sizeof(distStr), "%.0f m", distM);
         else
             snprintf(distStr, sizeof(distStr), "%.1f km", distM / 1000.0f);
-        sendTextAlert("🚨 %s pressed the panic button at %s - %s away, %d° (%s)", childName, timeStr, distStr,
+        sendTextAlert("%s pressed the panic button at %s - %s away, %d deg (%s)", childName, timeStr, distStr,
                       bearingDeg, ageStr);
         LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %.1f m away %d° (%s)", eventId, childName,
                  (uint16_t)mp.from, distM, bearingDeg, ageStr);
     } else {
-        sendTextAlert("🚨 %s pressed the panic button at %s - %s", childName, timeStr, ageStr);
+        sendTextAlert("%s pressed the panic button at %s - %s", childName, timeStr, ageStr);
         LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %s", eventId, childName, (uint16_t)mp.from, ageStr);
     }
 }
@@ -254,7 +254,7 @@ void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeN
     // 1) Human-readable Family Channel text (SPEC §34A) so the whole family
     //    (and any parent console/app) sees who responded and what they said.
     char buf[128];
-    snprintf(buf, sizeof(buf), "🚨 %s: %s", owner.short_name, msg);
+    snprintf(buf, sizeof(buf), "%s: %s", owner.short_name, msg);
     sendTextAlert("%s", buf);
 
     // 2) PARENT_ON_WAY datagram, targeted to the child: distinct tone + on-screen
@@ -406,7 +406,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             if (nowSecs) {
                 snprintf(timeStr, sizeof(timeStr), "%02u:%02u", (nowSecs / 3600) % 24, (nowSecs / 60) % 60);
             }
-            sendTextAlert("🚨 PANIC sent by %s at %s - event %u", owner.short_name, timeStr, pe);
+            sendTextAlert("PANIC sent by %s at %s - event %u", owner.short_name, timeStr, pe);
         }
         break;
 #endif
@@ -474,7 +474,7 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
                 if (nowSecs) {
                     snprintf(timeStr, sizeof(timeStr), "%02u:%02u", (nowSecs / 3600) % 24, (nowSecs / 60) % 60);
                 }
-                sendTextAlert("🚨 PANIC sent by %s at %s - event %u", owner.short_name, timeStr, eventId);
+                sendTextAlert("PANIC sent by %s at %s - event %u", owner.short_name, timeStr, eventId);
             }
             break;
         default:
@@ -530,13 +530,13 @@ int32_t FamilyTrackerModule::runOnce()
             buzzerBeep(true);
             LOG_WARN("FamilyTracker: CHILD 0x%08x MISSED CHECK-IN (%u s ago)", n->num, age);
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
-            sendTextAlert("⚠️ %s missed check-in (%u s ago) - no contact", cn ? cn : "Child", age / 1000);
+            sendTextAlert("MISSED CHECK-IN: %s missed check-in (%u s ago) - no contact", cn ? cn : "Child", age / 1000);
             alertedMissed.push_back(n->num);
         } else if (!missed && wasMissed) {
             // Recovery (SPEC §21)
             LOG_INFO("FamilyTracker: CHILD 0x%08x check-in resumed", n->num);
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
-            sendTextAlert("✅ %s check-in resumed - contact restored", cn ? cn : "Child");
+            sendTextAlert("CHECK-IN RESUMED: %s check-in resumed - contact restored", cn ? cn : "Child");
             alertedMissed.erase(std::remove(alertedMissed.begin(), alertedMissed.end(), n->num), alertedMissed.end());
         }
 
@@ -550,7 +550,7 @@ int32_t FamilyTrackerModule::runOnce()
                 buzzerBeep(false);
                 LOG_WARN("FamilyTracker: CHILD 0x%08x LOW BATTERY %u%%", n->num, metrics.battery_level);
                 const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
-                sendTextAlert("🔋 %s low battery %u%%", cn ? cn : "Child", metrics.battery_level);
+                sendTextAlert("LOW BATTERY: %s low battery %u%%", cn ? cn : "Child", metrics.battery_level);
                 alertedBattery.push_back(n->num);
             }
         } else {
