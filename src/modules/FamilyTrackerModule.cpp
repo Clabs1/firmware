@@ -461,6 +461,62 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
     }
 #endif
 
+    case FAMILYTRACKER_MSG_COME_BACK:
+        // Parent -> child: "come back now". Distinct tone + on-screen message.
+        if (isChild() && (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to))) {
+            playLongBeep();
+            if (screen)
+                screen->showSimpleBanner("Come back now!", 8000);
+            LOG_INFO("FamilyTracker: COME BACK from 0x%08x", mp.from);
+        }
+        break;
+
+    case FAMILYTRACKER_MSG_LOST_CHILD: {
+        // Parent -> group: "child X is lost". Target node rides in payload
+        // bytes 8-11 (uint32 LE). The target child enters lost mode (fast
+        // check-in) and announces itself; parents raise a local alert.
+        uint32_t target = 0;
+        if (mp.decoded.payload.size >= 12) {
+            const uint8_t *b = mp.decoded.payload.bytes;
+            target = (uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24);
+        }
+        if (isChild() && target == nodeDB->getNodeNum()) {
+            lostModeUntilMs = millis() + FAMILYTRACKER_LOST_MODE_SECS * 1000UL;
+            playComboTune();
+            if (screen)
+                screen->showSimpleBanner("Lost child - stay where you are", 15000);
+            char lost[64];
+            snprintf(lost, sizeof(lost), "%s is lost - please help find me", owner.short_name);
+            sendTextAlert("%s", lost);
+            LOG_WARN("FamilyTracker: LOST CHILD (me) - entering lost mode");
+        } else if (isParent()) {
+            const meshtastic_NodeInfoLite *c = nodeDB->getMeshNode(target);
+            const char *cn = "Child";
+            if (c && c->long_name[0])
+                cn = c->long_name;
+            else if (c && c->short_name[0])
+                cn = c->short_name;
+            playComboTune();
+            if (screen) {
+                char banner[80];
+                snprintf(banner, sizeof(banner), "%s is lost - look for them", cn);
+                screen->showSimpleBanner(banner, 15000);
+            }
+            LOG_WARN("FamilyTracker: LOST CHILD %s (0x%08x) - please look for them", cn, target);
+        }
+        break;
+    }
+
+    case FAMILYTRACKER_MSG_FIND_SOUND:
+        // Any role: loud repeating find tone (locate a node in a crowd / dropped
+        // in grass). runOnce() re-beeps it and stops after the timeout.
+        if (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to)) {
+            findSoundUntilMs = millis() + FAMILYTRACKER_FIND_SOUND_SECS * 1000UL;
+            lastFindBeepMs = 0; // re-beep immediately on the next fast tick
+            LOG_INFO("FamilyTracker: FIND SOUND from 0x%08x", mp.from);
+        }
+        break;
+
     default:
         return ProcessMessage::CONTINUE;
     }
@@ -497,12 +553,29 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
 // Child: periodic CHECKIN heartbeat independent of GPS (SPEC §13/§14/§18).
 int32_t FamilyTrackerModule::runOnce()
 {
+    // Find sound: re-beep the loud tone while active (any role). Fast tick so
+    // the cadence is responsive; auto-stops when the timeout expires.
+    if (findSoundUntilMs) {
+        if ((int32_t)(millis() - findSoundUntilMs) >= 0) {
+            findSoundUntilMs = 0;
+        } else if (millis() - lastFindBeepMs >= FAMILYTRACKER_FIND_BEEP_INTERVAL_MS) {
+            lastFindBeepMs = millis();
+            playComboTune();
+        }
+        return 500;
+    }
+
     if (isChild()) {
+        // Lost mode: much faster check-in cadence while a search is active.
+        if (lostModeUntilMs && (int32_t)(millis() - lostModeUntilMs) >= 0)
+            lostModeUntilMs = 0; // auto-expire
+        uint32_t intervalMs = lostModeUntilMs ? FAMILYTRACKER_LOST_CHECKIN_SECS * 1000UL
+                                             : FAMILYTRACKER_CHECKIN_INTERVAL_SECS * 1000UL;
         // Periodic check-in so the parent can monitor us even without a GPS fix.
         // Use millis() (monotonic) not getValidTime() so it works without an RTC.
         static uint32_t lastCheckinMs = 0;
         uint32_t nowMs = millis();
-        if (nowMs - lastCheckinMs >= (uint32_t)FAMILYTRACKER_CHECKIN_INTERVAL_SECS * 1000UL) {
+        if (nowMs - lastCheckinMs >= intervalMs) {
             lastCheckinMs = nowMs;
             sendMessage(FAMILYTRACKER_MSG_CHECKIN, 0, true, false, 0);
         }

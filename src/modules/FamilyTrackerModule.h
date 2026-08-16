@@ -51,6 +51,9 @@
 #define FAMILYTRACKER_MSG_CONFIG      0x07  // set watchdog timeout / low-battery % (remote test config)
 #define FAMILYTRACKER_MSG_PARENT_ON_WAY  0x08  // parent -> child: "read + on the way" (preselected msg)
 #define FAMILYTRACKER_MSG_ON_WAY_TRIGGER 0x09  // remote trigger for hands-off testing (like PANIC_TRIGGER)
+#define FAMILYTRACKER_MSG_COME_BACK     0x0A  // parent -> child: "come back now" (tone + banner)
+#define FAMILYTRACKER_MSG_LOST_CHILD    0x0B  // parent -> group: "child X is lost" (target node in payload)
+#define FAMILYTRACKER_MSG_FIND_SOUND    0x0C  // any -> node: loud repeating find tone
 
 // Preselected "on the way" response messages (SPEC §34A). The parent picks one
 // and it is sent to the child as a human-readable Family Channel text plus a
@@ -67,6 +70,12 @@
 // Parent watchdog defaults (SPEC §18/§19/§22)
 #define FAMILYTRACKER_DEFAULT_MISSED_TIMEOUT_SECS (10 * 60)
 #define FAMILYTRACKER_DEFAULT_LOW_BATTERY_PCT    20
+
+// Parent-triggered flows (parent -> child/group)
+#define FAMILYTRACKER_LOST_MODE_SECS        (10 * 60)  // child auto-exits lost mode after 10 min
+#define FAMILYTRACKER_LOST_CHECKIN_SECS     10         // fast check-in cadence while lost
+#define FAMILYTRACKER_FIND_SOUND_SECS       30         // find tone auto-stops after 30 s
+#define FAMILYTRACKER_FIND_BEEP_INTERVAL_MS 2000       // re-beep cadence for the find sound
 
 // Child periodic check-in cadence (SPEC §13/§14/§18) - independent of GPS so the
 // parent can always distinguish "idle" from "missing".
@@ -166,6 +175,11 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // Watchdog tuning (remote CONFIG message, FAMILYTRACKER_MSG_CONFIG).
     uint32_t missedTimeoutSecs = FAMILYTRACKER_DEFAULT_MISSED_TIMEOUT_SECS;
     uint8_t lowBatteryPct = FAMILYTRACKER_DEFAULT_LOW_BATTERY_PCT;
+
+    // Parent-triggered flows (COME_BACK / LOST_CHILD / FIND_SOUND).
+    uint32_t lostModeUntilMs = 0;  // child: fast check-in cadence until this time
+    uint32_t findSoundUntilMs = 0; // any role: re-beep the find tone until this time
+    uint32_t lastFindBeepMs = 0;
 };
 
 extern FamilyTrackerModule *familyTrackerModule;
