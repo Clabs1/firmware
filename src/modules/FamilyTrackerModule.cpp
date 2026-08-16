@@ -553,6 +553,65 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
     return 0;
 }
 
+// Nearest-parent direction+distance display (SPEC §35): the child with a screen
+// shows the nearest non-child node's name, distance and bearing as a persistent
+// banner, refreshed periodically.
+void FamilyTrackerModule::updateNearestParentDisplay()
+{
+    if (!screen)
+        return;
+
+    const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    bool haveSelf = self && nodeDB->hasValidPosition(self);
+
+    float bestDistM = 1e9f;
+    int bestBearing = 0;
+    const char *bestName = nullptr;
+
+    if (haveSelf) {
+        float selfLat = localPosition.latitude_i * 1e-7;
+        float selfLon = localPosition.longitude_i * 1e-7;
+        size_t count = nodeDB->getNumMeshNodes();
+        for (size_t i = 0; i < count; i++) {
+            const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+            if (!n || n->num == nodeDB->getNodeNum())
+                continue;
+            if (n->role == meshtastic_Config_DeviceConfig_Role_TRACKER ||
+                n->role == meshtastic_Config_DeviceConfig_Role_TAK_TRACKER)
+                continue; // skip children
+            if (!nodeDB->hasValidPosition(n))
+                continue;
+            meshtastic_PositionLite pos;
+            if (!nodeDB->copyNodePosition(n->num, pos))
+                continue;
+            float plat = pos.latitude_i * 1e-7;
+            float plon = pos.longitude_i * 1e-7;
+            float d = GeoCoord::latLongToMeter(selfLat, selfLon, plat, plon);
+            if (d < bestDistM) {
+                bestDistM = d;
+                bestBearing = (int)GeoCoord::bearing(selfLat, selfLon, plat, plon);
+                if (bestBearing < 0)
+                    bestBearing += 360;
+                bestName = (n->long_name[0]) ? n->long_name : n->short_name;
+            }
+        }
+    }
+
+    char b[96];
+    if (!haveSelf) {
+        snprintf(b, sizeof(b), "No GPS fix - waiting");
+    } else if (bestName) {
+        if (bestDistM < 1000.0f)
+            snprintf(b, sizeof(b), "Nearest parent: %s %.0f m %d deg", bestName, bestDistM, bestBearing);
+        else
+            snprintf(b, sizeof(b), "Nearest parent: %s %.1f km %d deg", bestName, bestDistM / 1000.0f, bestBearing);
+    } else {
+        snprintf(b, sizeof(b), "No parent in range");
+    }
+    screen->showSimpleBanner(b, 0); // persistent until next refresh/message
+    LOG_INFO("FamilyTracker: nearest-parent display = %s", b);
+}
+
 // Parent watchdog: missed check-in + low battery (SPEC §18-§23).
 // Child: periodic CHECKIN heartbeat independent of GPS (SPEC §13/§14/§18).
 int32_t FamilyTrackerModule::runOnce()
@@ -577,6 +636,12 @@ int32_t FamilyTrackerModule::runOnce()
     }
 
     if (isChild()) {
+        // Nearest-parent display (SPEC §35): refresh every 30 s.
+        if (millis() - lastNearestParentMs >= 30000UL) {
+            lastNearestParentMs = millis();
+            updateNearestParentDisplay();
+        }
+
         // Lost mode: much faster check-in cadence while a search is active.
         if (lostModeUntilMs && (int32_t)(millis() - lostModeUntilMs) >= 0)
             lostModeUntilMs = 0; // auto-expire

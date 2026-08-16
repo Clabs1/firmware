@@ -130,6 +130,11 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // on-screen message at the child). SPEC §34A.
     void sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeNum to);
 
+    // Nearest-parent direction+distance display (SPEC §35). Child with a screen
+    // shows the nearest parent's name, distance and bearing as its default
+    // on-screen status, refreshed periodically from runOnce().
+    void updateNearestParentDisplay();
+
     // Parent watchdog state
     std::vector<NodeNum> alertedMissed;
     std::vector<NodeNum> alertedBattery;
@@ -186,6 +191,9 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // T1 parent when the text loops back).
     char pendingAlert[128] = {0};
     bool alertPending = false;
+
+    // Nearest-parent display cadence.
+    uint32_t lastNearestParentMs = 0;
 };
 
 extern FamilyTrackerModule *familyTrackerModule;
