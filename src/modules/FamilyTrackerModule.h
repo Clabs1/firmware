@@ -5,6 +5,8 @@
 #include "SinglePortModule.h"
 #include "configuration.h"
 #include "concurrency/OSThread.h"
+#include "concurrency/Lock.h"
+#include "concurrency/LockGuard.h"
 #include "input/InputBroker.h"
 #include <map>
 #include <vector>
@@ -130,8 +132,15 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // false-alert even though the child is CHECKINing every 2 min. Updated on any
     // child-originated FamilyTracker message (CHECKIN/PANIC/LOCATE_RESP/ON_WAY rx).
     std::map<NodeNum, uint32_t> childLastSeenMs;
+    // childLastSeenMs is written by markChildSeen() on the Router thread
+    // (handleReceived) and read by msSinceChildSeen() on this module's own
+    // OSThread (runOnce watchdog). Without a lock the concurrent find/erase
+    // corrupts the map and hangs the parent. Mutable so the const reader can
+    // still take it.
+    mutable concurrency::Lock childSeenLock;
     void markChildSeen(NodeNum from, uint32_t nowMs)
     {
+        concurrency::LockGuard guard(&childSeenLock);
         childLastSeenMs[from] = nowMs;
         // forget children silent for > 1 h so the map stays small
         for (auto it = childLastSeenMs.begin(); it != childLastSeenMs.end();) {
@@ -143,6 +152,7 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     }
     uint32_t msSinceChildSeen(NodeNum n) const
     {
+        concurrency::LockGuard guard(&childSeenLock);
         auto it = childLastSeenMs.find(n);
         if (it == childLastSeenMs.end())
             return UINT32_MAX;

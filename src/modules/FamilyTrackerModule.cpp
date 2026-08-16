@@ -119,6 +119,15 @@ void FamilyTrackerModule::renderPanicAlert(const meshtastic_MeshPacket &mp, uint
         childName = nameBuf;
     }
 
+    // Urgent on-screen banner (SPEC §34A "child name PANIC button pressed"):
+    // the text-message path would only show a generic "New Message from X", so
+    // surface the panic explicitly on display hardware.
+    if (screen) {
+        char banner[80];
+        snprintf(banner, sizeof(banner), "%s PANIC button pressed", childName);
+        screen->showSimpleBanner(banner, 15000);
+    }
+
     // Panic time: our device RTC at receipt (hh:mm).
     char timeStr[8] = "--:--";
     uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, true); // already local (TZ applied)
