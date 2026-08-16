@@ -910,6 +910,10 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT; // Default to client.
 #endif
 
+#ifdef USERPREFS_CONFIG_DEVICE_BUZZER_MODE
+    config.device.buzzer_mode = USERPREFS_CONFIG_DEVICE_BUZZER_MODE;
+#endif
+
 #ifdef USERPREFS_CONFIG_LORA_REGION
     config.lora.region = USERPREFS_CONFIG_LORA_REGION;
 #else
