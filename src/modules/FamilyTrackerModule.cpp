@@ -169,14 +169,18 @@ void FamilyTrackerModule::renderPanicAlert(const meshtastic_MeshPacket &mp, uint
             snprintf(distStr, sizeof(distStr), "%.0f m", distM);
         else
             snprintf(distStr, sizeof(distStr), "%.1f km", distM / 1000.0f);
-        sendTextAlert("%s pressed the panic button at %s - %s away, %d deg (%s)", childName, timeStr, distStr,
-                      bearingDeg, ageStr);
+        // Defer the text send: sending TEXT_MESSAGE_APP from inside the RX path
+        // makes the packet loop back and re-enter the message store, whose flash
+        // save nests spiLock and hangs the (T1) parent. Queue for runOnce().
+        snprintf(pendingAlert, sizeof(pendingAlert), "%s pressed the panic button at %s - %s away, %d deg (%s)",
+                 childName, timeStr, distStr, bearingDeg, ageStr);
         LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %.1f m away %d° (%s)", eventId, childName,
                  (uint16_t)mp.from, distM, bearingDeg, ageStr);
     } else {
-        sendTextAlert("%s pressed the panic button at %s - %s", childName, timeStr, ageStr);
+        snprintf(pendingAlert, sizeof(pendingAlert), "%s pressed the panic button at %s - %s", childName, timeStr, ageStr);
         LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %s", eventId, childName, (uint16_t)mp.from, ageStr);
     }
+    alertPending = true;
 }
 
 void FamilyTrackerModule::sendMessage(uint8_t msgType, uint32_t eventId, bool hasPos, bool stale, uint8_t ageMin)
@@ -553,6 +557,13 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
 // Child: periodic CHECKIN heartbeat independent of GPS (SPEC §13/§14/§18).
 int32_t FamilyTrackerModule::runOnce()
 {
+    // Flush a deferred panic alert (queued by renderPanicAlert to avoid a
+    // reentrant message-store write that hangs the T1 parent).
+    if (alertPending) {
+        alertPending = false;
+        sendTextAlert("%s", pendingAlert);
+    }
+
     // Find sound: re-beep the loud tone while active (any role). Fast tick so
     // the cadence is responsive; auto-stops when the timeout expires.
     if (findSoundUntilMs) {

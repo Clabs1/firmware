@@ -180,6 +180,12 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     uint32_t lostModeUntilMs = 0;  // child: fast check-in cadence until this time
     uint32_t findSoundUntilMs = 0; // any role: re-beep the find tone until this time
     uint32_t lastFindBeepMs = 0;
+
+    // Deferred panic alert text (queued by renderPanicAlert, sent on the next
+    // runOnce tick to avoid a reentrant message-store flash write that hangs the
+    // T1 parent when the text loops back).
+    char pendingAlert[128] = {0};
+    bool alertPending = false;
 };
 
 extern FamilyTrackerModule *familyTrackerModule;
