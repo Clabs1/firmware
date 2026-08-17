@@ -521,6 +521,32 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         }
         break;
 
+    case FAMILYTRACKER_MSG_CANCEL:
+        // Stand-down: a parent cancels an active alert (panic / lost-mode /
+        // find-sound) on this node. Only a non-child (parent) may send it.
+        {
+            const meshtastic_NodeInfoLite *sender = nodeDB->getMeshNode(mp.from);
+            bool senderIsParent =
+                sender && sender->role != meshtastic_Config_DeviceConfig_Role_TRACKER &&
+                sender->role != meshtastic_Config_DeviceConfig_Role_TAK_TRACKER;
+            if (!senderIsParent) {
+                LOG_WARN("FamilyTracker: CANCEL ignored (sender 0x%08x is not a parent)", mp.from);
+                break;
+            }
+        }
+        if (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to)) {
+            const meshtastic_NodeInfoLite *sender = nodeDB->getMeshNode(mp.from);
+            const char *pn = (sender && sender->long_name[0])
+                                 ? sender->long_name
+                                 : (sender && sender->short_name[0]) ? sender->short_name : "Parent";
+            findSoundUntilMs = 0;
+            lostModeUntilMs = 0;
+            lastPanicEventId = 0; // stand down any outstanding panic
+            sendTextAlert("STOOD DOWN: %s cancelled the alert", pn);
+            LOG_WARN("FamilyTracker: STOOD DOWN by %s (0x%08x)", pn, mp.from);
+        }
+        break;
+
     default:
         return ProcessMessage::CONTINUE;
     }

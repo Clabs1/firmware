@@ -54,6 +54,7 @@
 #define FAMILYTRACKER_MSG_COME_BACK     0x0A  // parent -> child: "come back now" (tone + banner)
 #define FAMILYTRACKER_MSG_LOST_CHILD    0x0B  // parent -> group: "child X is lost" (target node in payload)
 #define FAMILYTRACKER_MSG_FIND_SOUND    0x0C  // any -> node: loud repeating find tone
+#define FAMILYTRACKER_MSG_CANCEL        0x0D  // any -> node: cancel active find-sound / lost-mode
 
 // Preselected "on the way" response messages (SPEC §34A). The parent picks one
 // and it is sent to the child as a human-readable Family Channel text plus a
