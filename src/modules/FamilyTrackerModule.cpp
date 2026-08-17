@@ -5,6 +5,9 @@
 #include "gps/RTC.h"
 #include "gps/GeoCoord.h"
 #include "buzz/buzz.h"
+#if HAS_SCREEN
+#include "graphics/draw/NotificationRenderer.h"
+#endif
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
@@ -244,7 +247,7 @@ void FamilyTrackerModule::sendMessageTo(uint8_t msgType, uint32_t eventId, bool 
     service->sendToMesh(p, RX_SRC_LOCAL, true);
 
     if (msgType == FAMILYTRACKER_MSG_PANIC)
-        buzzerBeep(false); // SENT tone (SPEC §33)
+        playPanicCall(); // SENT tone - three short "call" notes (SPEC §33)
 
     LOG_INFO("FamilyTracker: TX msg=%u event=%u to=%04x%s%s", msgType, eventId, (uint16_t)to, hasPos ? " pos" : "",
              stale ? " (stale)" : "");
@@ -274,6 +277,138 @@ void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeN
     //    message at the child. presetIndex rides in the ageMin byte.
     sendMessageTo(FAMILYTRACKER_MSG_PARENT_ON_WAY, eventId, false, false, presetIndex, to);
     LOG_INFO("FamilyTracker: PARENT_ON_WAY event=%u to=%04x preset=%u '%s'", eventId, (uint16_t)to, presetIndex, msg);
+}
+
+void FamilyTrackerModule::sendComeBack()
+{
+    // Parent -> all children: "come back now" (regroup). Broadcast so every child
+    // hears the Mario tune + banner, not just one.
+    sendMessageTo(FAMILYTRACKER_MSG_COME_BACK, 0, false, false, 0, NODENUM_BROADCAST);
+    LOG_WARN("FamilyTracker: COME BACK broadcast by parent");
+}
+
+void FamilyTrackerModule::sendFound()
+{
+    // Parent concludes a lost/panic search: broadcast a stand-down so EVERY node
+    // clears its state and plays the "level complete" success tone. The child that
+    // was actually active announces "FOUND" once (see the CANCEL handler).
+    sendMessageTo(FAMILYTRACKER_MSG_CANCEL, 0, false, false, 0, NODENUM_BROADCAST);
+    LOG_WARN("FamilyTracker: FOUND stand-down broadcast by parent");
+}
+
+// Whole-word command match: the command must be followed by a non-alphanumeric
+// character (space, punctuation, or end) so "lost" doesn't fire on "lostal".
+static bool matchCommand(const char *text, const char *cmd)
+{
+    size_t n = strlen(cmd);
+    if (strncasecmp(text, cmd, n) != 0)
+        return false;
+    char c = text[n];
+    return !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9');
+}
+
+// Extract the child name after a command, trimming surrounding whitespace and
+// trailing punctuation ("lost Alice!" -> "Alice").
+static void extractName(const char *src, char *out, size_t outLen)
+{
+    while (*src == ' ' || *src == '\t')
+        src++;
+    size_t n = 0;
+    while (src[n] && n < outLen - 1) {
+        char c = src[n];
+        if (c == '.' || c == '!' || c == '?' || c == ',' || c == ';' || c == '\n' || c == '\r')
+            break;
+        out[n++] = c;
+    }
+    out[n] = '\0';
+    while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\t'))
+        out[--n] = '\0';
+}
+
+bool FamilyTrackerModule::handleFamilyCommand(const char *text)
+{
+    if (!text || !isParent())
+        return false;
+
+    // Trim leading whitespace, then match whole commands case-insensitively.
+    while (*text == ' ' || *text == '\t')
+        text++;
+
+    if (matchCommand(text, "come back")) {
+        sendComeBack();
+        return true;
+    }
+    if (matchCommand(text, "found")) {
+        sendFound();
+        return true;
+    }
+    if (matchCommand(text, "lost")) {
+        // "lost <name>" (canned) - name follows "lost".
+        char name[32];
+        extractName(text + 4, name, sizeof(name));
+        if (name[0]) {
+            NodeNum target = findChildByName(name);
+            if (target) {
+                sendLostChild(target);
+                return true;
+            }
+            sendTextAlert("No child named \"%s\" found", name);
+            return true;
+        }
+        pickLostChild(); // bare "lost": pick from the checked-in children
+        return true;
+    }
+    return false;
+}
+
+NodeNum FamilyTrackerModule::findChildByName(const char *name)
+{
+    if (!name || !*name)
+        return 0;
+
+    // Only children that have actually checked in (heartbeat) are considered -
+    // the nodedb may hold stale or non-family TRACKER nodes.
+    std::vector<NodeNum> checkedIn;
+    {
+        concurrency::LockGuard guard(&childSeenLock);
+        for (const auto &kv : childLastSeenMs)
+            checkedIn.push_back(kv.first);
+    }
+    for (NodeNum num : checkedIn) {
+        const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(num);
+        if (!n)
+            continue;
+        if ((n->long_name[0] && strcasecmp(n->long_name, name) == 0) ||
+            (n->short_name[0] && strcasecmp(n->short_name, name) == 0))
+            return num;
+    }
+    return 0;
+}
+
+void FamilyTrackerModule::sendLostChild(NodeNum target)
+{
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (!p)
+        return;
+
+    uint8_t payload[12] = {0};
+    payload[0] = FAMILYTRACKER_PROTOCOL_VERSION;
+    payload[1] = FAMILYTRACKER_MSG_LOST_CHILD;
+    payload[8] = target & 0xFF;
+    payload[9] = (target >> 8) & 0xFF;
+    payload[10] = (target >> 16) & 0xFF;
+    payload[11] = (target >> 24) & 0xFF;
+    p->to = NODENUM_BROADCAST;
+    p->decoded.payload.size = sizeof(payload);
+    memcpy(p->decoded.payload.bytes, payload, sizeof(payload));
+    service->sendToMesh(p, RX_SRC_LOCAL, true);
+
+    // Regroup: everyone comes back when a child is reported lost.
+    sendComeBack();
+
+    const meshtastic_NodeInfoLite *c = nodeDB->getMeshNode(target);
+    const char *cn = (c && c->long_name[0]) ? c->long_name : (c && c->short_name[0]) ? c->short_name : "Child";
+    LOG_WARN("FamilyTracker: LOST CHILD %s (0x%08x) + come-back broadcast", cn, target);
 }
 
 // Human-readable alert broadcast on the family channel (TEXT_MESSAGE_APP).
@@ -323,8 +458,98 @@ bool FamilyTrackerModule::isValidMessage(const meshtastic_MeshPacket &mp, uint8_
     return true;
 }
 
+// Case-insensitive substring search (strcasestr is not portable across the
+// ESP32/nRF52 newlib builds).
+static const char *findNoCase(const char *haystack, const char *needle)
+{
+    size_t nlen = strlen(needle);
+    for (const char *h = haystack; *h; h++) {
+        if (strncasecmp(h, needle, nlen) == 0)
+            return h;
+    }
+    return nullptr;
+}
+
+ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacket &mp)
+{
+    if (!isParent())
+        return ProcessMessage::CONTINUE;
+
+    char buf[64];
+    size_t len = mp.decoded.payload.size;
+    if (len >= sizeof(buf))
+        len = sizeof(buf) - 1;
+    memcpy(buf, mp.decoded.payload.bytes, len);
+    buf[len] = '\0';
+
+    char name[32];
+    const char *src = nullptr;
+
+    // "<name> is lost" (app-side canned message)
+    const char *p = findNoCase(buf, " is lost");
+    if (p && p > buf) {
+        size_t n = p - buf;
+        if (n >= sizeof(name))
+            n = sizeof(name) - 1;
+        memcpy(name, buf, n);
+        name[n] = '\0';
+        src = name;
+    } else if (matchCommand(buf, "lost")) {
+        // "lost <name>" or bare "lost"
+        extractName(buf + 4, name, sizeof(name));
+        if (!name[0]) {
+            pickLostChild();
+            return ProcessMessage::STOP;
+        }
+        src = name;
+    } else {
+        return ProcessMessage::CONTINUE;
+    }
+
+    NodeNum target = findChildByName(src);
+    if (target) {
+        sendLostChild(target);
+        return ProcessMessage::STOP;
+    }
+    sendTextAlert("No child named \"%s\" found", src);
+    return ProcessMessage::STOP;
+}
+
+void FamilyTrackerModule::pickLostChild()
+{
+#if HAS_SCREEN
+    if (!screen)
+        return;
+
+    // Populate the picker from the children that have actually checked in
+    // (heartbeat), so only live children with real names are offered.
+    static std::vector<uint32_t> lostChildList;
+    lostChildList.clear();
+    {
+        concurrency::LockGuard guard(&childSeenLock);
+        for (const auto &kv : childLastSeenMs)
+            lostChildList.push_back(kv.first);
+    }
+    if (lostChildList.empty()) {
+        sendTextAlert("No children have checked in yet");
+        return;
+    }
+
+    screen->showNodePicker("Select lost child", 60000, [](uint32_t num) {
+        if (familyTrackerModule && num)
+            familyTrackerModule->sendLostChild(num);
+    });
+    // set after showNodePicker (which resets the filter to "all nodes")
+    graphics::NotificationRenderer::setNodePickerFilter(&lostChildList);
+#endif
+}
+
 ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
+    // Human-readable family commands ("Child 1 is lost") arrive as text.
+    if (mp.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP)
+        return handleTextCommand(mp);
+
     uint8_t msgType, flags, ageMin;
     uint32_t eventId;
     meshtastic_PositionLite pos;
@@ -344,7 +569,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                 renderPanicAlert(mp, eventId, pos, (flags & FAMILYTRACKER_FLAG_POS_STALE) != 0, ageMin,
                                  (flags & FAMILYTRACKER_FLAG_HAS_POS) != 0);
             }
-            buzzerBeep(true); // alert
+            playPanicAlert(); // alert (distinct from the child's call)
             sendAck(eventId, mp.from); // SPEC §34 — targeted to the panicking child (multi-Child §18A)
         }
         break;
@@ -356,7 +581,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         // locally-numbered event. Accept targeted ACKs, and broadcast ACKs only
         // when they match our own outstanding panic (backwards compat).
         if (isChild() && eventId == lastPanicEventId && (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to))) {
-            buzzerBeep(true);
+            playPanicResponse(); // rising "response" completes the call/response (SPEC §34)
             LOG_INFO("FamilyTracker: PANIC ACKED event=%u from 0x%08x", eventId, mp.from);
         }
         break;
@@ -414,12 +639,6 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             uint32_t pe = nextEventId++;
             lastPanicEventId = pe; // so the returning ACK matches (SPEC §34)
             sendMessage(FAMILYTRACKER_MSG_PANIC, pe, true, false, 0);
-            char timeStr[8] = "--:--";
-            uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, true); // already local (TZ applied)
-            if (nowSecs) {
-                snprintf(timeStr, sizeof(timeStr), "%02u:%02u", (nowSecs / 3600) % 24, (nowSecs / 60) % 60);
-            }
-            sendTextAlert("PANIC sent by %s at %s - event %u", owner.short_name, timeStr, pe);
         }
         break;
 #endif
@@ -468,7 +687,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
     case FAMILYTRACKER_MSG_COME_BACK:
         // Parent -> child: "come back now". Distinct tone + on-screen message.
         if (isChild() && (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to))) {
-            playLongBeep();
+            playMarioMelody(); // distinct "come back" tune (SPEC §34A)
             if (screen)
                 screen->showSimpleBanner("Come back now!", 8000);
             LOG_INFO("FamilyTracker: COME BACK from 0x%08x", mp.from);
@@ -486,7 +705,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         }
         if (isChild() && target == nodeDB->getNodeNum()) {
             lostModeActive = true; // persists until a parent sends FOUND
-            playComboTune();
+            playSosTone(); // SOS in morse - "you are lost"
             if (screen)
                 screen->showSimpleBanner("Lost child - stay where you are", 15000);
             char lost[64];
@@ -500,7 +719,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                 cn = c->long_name;
             else if (c && c->short_name[0])
                 cn = c->short_name;
-            playComboTune();
+            playLostAlert(); // distinct from the child's SOS
             if (screen) {
                 char banner[80];
                 snprintf(banner, sizeof(banner), "%s is lost - look for them", cn);
@@ -539,11 +758,19 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             const char *pn = (sender && sender->long_name[0])
                                  ? sender->long_name
                                  : (sender && sender->short_name[0]) ? sender->short_name : "Parent";
+            // Only the node that actually had an active alert announces "found"
+            // (so a broadcast stand-down doesn't make every node claim it was
+            // found). Everyone else just stands down with the success tone.
+            bool wasActive = findSoundUntilMs != 0 || lostModeActive || (isChild() && lastPanicEventId != 0);
             findSoundUntilMs = 0;
             lostModeActive = false;
             lastPanicEventId = 0; // stand down any outstanding panic
-            sendTextAlert("FOUND: %s found by %s - standing down", owner.short_name, pn);
-            LOG_WARN("FamilyTracker: FOUND %s by %s (0x%08x)", owner.short_name, pn, mp.from);
+            playFoundMelody();    // "level complete" success tone
+            if (screen)
+                screen->showSimpleBanner("Found - standing down", 8000);
+            if (wasActive)
+                sendTextAlert("FOUND: %s found by %s - standing down", owner.short_name, pn);
+            LOG_WARN("FamilyTracker: FOUND by %s (0x%08x)", pn, mp.from);
         }
         break;
 
@@ -572,12 +799,6 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
                 uint32_t eventId = nextEventId++;
                 lastPanicEventId = eventId; // so the returning ACK matches (SPEC §34)
                 sendMessage(FAMILYTRACKER_MSG_PANIC, eventId, true, false, 0);
-                char timeStr[8] = "--:--";
-                uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, true); // already local (TZ applied)
-                if (nowSecs) {
-                    snprintf(timeStr, sizeof(timeStr), "%02u:%02u", (nowSecs / 3600) % 24, (nowSecs / 60) % 60);
-                }
-                sendTextAlert("PANIC sent by %s at %s - event %u", owner.short_name, timeStr, eventId);
             }
             break;
         default:
@@ -585,65 +806,6 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
         }
     }
     return 0;
-}
-
-// Nearest-parent direction+distance display (SPEC §35): the child with a screen
-// shows the nearest non-child node's name, distance and bearing as a persistent
-// banner, refreshed periodically.
-void FamilyTrackerModule::updateNearestParentDisplay()
-{
-    if (!screen)
-        return;
-
-    const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
-    bool haveSelf = self && nodeDB->hasValidPosition(self);
-
-    float bestDistM = 1e9f;
-    int bestBearing = 0;
-    const char *bestName = nullptr;
-
-    if (haveSelf) {
-        float selfLat = localPosition.latitude_i * 1e-7;
-        float selfLon = localPosition.longitude_i * 1e-7;
-        size_t count = nodeDB->getNumMeshNodes();
-        for (size_t i = 0; i < count; i++) {
-            const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
-            if (!n || n->num == nodeDB->getNodeNum())
-                continue;
-            if (n->role == meshtastic_Config_DeviceConfig_Role_TRACKER ||
-                n->role == meshtastic_Config_DeviceConfig_Role_TAK_TRACKER)
-                continue; // skip children
-            if (!nodeDB->hasValidPosition(n))
-                continue;
-            meshtastic_PositionLite pos;
-            if (!nodeDB->copyNodePosition(n->num, pos))
-                continue;
-            float plat = pos.latitude_i * 1e-7;
-            float plon = pos.longitude_i * 1e-7;
-            float d = GeoCoord::latLongToMeter(selfLat, selfLon, plat, plon);
-            if (d < bestDistM) {
-                bestDistM = d;
-                bestBearing = (int)GeoCoord::bearing(selfLat, selfLon, plat, plon);
-                if (bestBearing < 0)
-                    bestBearing += 360;
-                bestName = (n->long_name[0]) ? n->long_name : n->short_name;
-            }
-        }
-    }
-
-    char b[96];
-    if (!haveSelf) {
-        snprintf(b, sizeof(b), "No GPS fix - waiting");
-    } else if (bestName) {
-        if (bestDistM < 1000.0f)
-            snprintf(b, sizeof(b), "Nearest parent: %s %.0f m %d deg", bestName, bestDistM, bestBearing);
-        else
-            snprintf(b, sizeof(b), "Nearest parent: %s %.1f km %d deg", bestName, bestDistM / 1000.0f, bestBearing);
-    } else {
-        snprintf(b, sizeof(b), "No parent in range");
-    }
-    screen->showSimpleBanner(b, 0); // persistent until next refresh/message
-    LOG_INFO("FamilyTracker: nearest-parent display = %s", b);
 }
 
 // Parent watchdog: missed check-in + low battery (SPEC §18-§23).
@@ -670,12 +832,6 @@ int32_t FamilyTrackerModule::runOnce()
     }
 
     if (isChild()) {
-        // Nearest-parent display (SPEC §35): refresh every 30 s.
-        if (millis() - lastNearestParentMs >= 30000UL) {
-            lastNearestParentMs = millis();
-            updateNearestParentDisplay();
-        }
-
         // Lost mode: much faster check-in cadence while a search is active.
         // Persists until a parent sends FOUND (no auto-timeout) - the searchers
         // keep tracking until the child is explicitly found.

@@ -51,6 +51,7 @@ const char **NotificationRenderer::optionsArrayPtr = nullptr;
 const int *NotificationRenderer::optionsEnumPtr = nullptr;
 std::function<void(int)> NotificationRenderer::alertBannerCallback = NULL;
 bool NotificationRenderer::pauseBanner = false;
+const std::vector<uint32_t> *NotificationRenderer::nodePickerFilter = nullptr;
 notificationTypeEnum NotificationRenderer::current_notification_type = notificationTypeEnum::none;
 uint32_t NotificationRenderer::numDigits = 0;
 uint32_t NotificationRenderer::currentNumber = 0;
@@ -587,6 +588,11 @@ void NotificationRenderer::drawNodePicker(OLEDDisplay *display, OLEDDisplayUiSta
     constexpr uint16_t vPadding = 2;
     alertBannerOptions = nodeDB->getNumMeshNodes() - 1;
 
+    // Family Tracker: optionally restrict the picker to a specific node list
+    // (the children that have checked in).
+    if (nodePickerFilter)
+        alertBannerOptions = nodePickerFilter->size();
+
     // let the box drawing function calculate the widths?
 
     const char *lineStarts[MAX_LINES + 1] = {0};
@@ -654,7 +660,8 @@ void NotificationRenderer::drawNodePicker(OLEDDisplay *display, OLEDDisplayUiSta
     int scratchLineNum = 0;
     for (int i = firstOptionToShow; i < alertBannerOptions && linesShown < visibleTotalLines; i++, linesShown++) {
         char tempName[48] = {0};
-        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i + 1);
+        meshtastic_NodeInfoLite *node = nodePickerFilter ? nodeDB->getMeshNode((*nodePickerFilter)[i])
+                                                         : nodeDB->getMeshNodeByIndex(i + 1);
         if (nodeInfoLiteHasUser(node)) {
             const char *rawName = nullptr;
             if (node->long_name[0]) {

@@ -27,6 +27,7 @@
 #include "mesh/generated/meshtastic/cannedmessages.pb.h"
 #include "modules/AdminModule.h"
 #include "modules/ExternalNotificationModule.h" // for buzzer control
+#include "modules/FamilyTrackerModule.h"
 extern MessageStore messageStore;
 #if HAS_TRACKBALL
 #include "input/TrackballInterruptImpl1.h"
@@ -1126,6 +1127,12 @@ void CannedMessageModule::sendText(NodeNum dest, ChannelIndex channel, const cha
     }
 
     playComboTune();
+
+    // Family Tracker: a canned/free message that matches a family command
+    // ("come back" / "found") also fires the matching datagram so children react
+    // with the right tone + banner.
+    if (familyTrackerModule && familyTrackerModule->handleFamilyCommand(message))
+        LOG_INFO("CannedMessage: family command '%s'", message);
 
     this->updateState(CANNED_MESSAGE_RUN_STATE_SENDING_ACTIVE);
     this->payload = wantReplies ? 1 : 0;

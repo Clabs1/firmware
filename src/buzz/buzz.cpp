@@ -51,6 +51,7 @@ struct ToneDuration {
 #define NOTE_C5 523
 #define NOTE_E5 659
 #define NOTE_G5 784
+#define NOTE_C6 1046
 
 const int DURATION_1_16 = 62;  // 1/16 note
 const int DURATION_1_8 = 125;  // 1/8 note
@@ -282,5 +283,65 @@ void play4ClickUp()
 {
     // Quick high-pitched notes with trills
     ToneDuration melody[] = {{NOTE_F5, 50}, {NOTE_G6, 45}, {NOTE_E7, 60}};
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playPanicCall()
+{
+    // Three short "call" notes - the child announcing its panic (call/response pair).
+    ToneDuration melody[] = {{NOTE_G4, 90}, {NOTE_SILENT, 70}, {NOTE_G4, 90}, {NOTE_SILENT, 70}, {NOTE_G4, 90}};
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playPanicAlert()
+{
+    // Urgent two-tone alert for the parent receiving a panic (distinct from the child's call).
+    ToneDuration melody[] = {{NOTE_C5, 140}, {NOTE_SILENT, 60}, {NOTE_C5, 140}, {NOTE_SILENT, 60}, {NOTE_C5, 140}};
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playPanicResponse()
+{
+    // Rising "response" the child hears when a parent ACKs - completes the call/response.
+    ToneDuration melody[] = {{NOTE_G4, 110}, {NOTE_C5, 220}};
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playSosTone()
+{
+    // SOS in morse: ... --- ... (dot=100ms, dash=300ms, 80ms gaps).
+    ToneDuration melody[] = {
+        {NOTE_E4, 100}, {NOTE_SILENT, 80}, {NOTE_E4, 100}, {NOTE_SILENT, 80}, {NOTE_E4, 100}, {NOTE_SILENT, 80},
+        {NOTE_E4, 300}, {NOTE_SILENT, 80}, {NOTE_E4, 300}, {NOTE_SILENT, 80}, {NOTE_E4, 300}, {NOTE_SILENT, 80},
+        {NOTE_E4, 100}, {NOTE_SILENT, 80}, {NOTE_E4, 100}, {NOTE_SILENT, 80}, {NOTE_E4, 100},
+    };
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playLostAlert()
+{
+    // Other parent hears "child X is lost - look for them" (distinct from SOS).
+    ToneDuration melody[] = {{NOTE_B3, 160}, {NOTE_SILENT, 80}, {NOTE_B3, 160}, {NOTE_SILENT, 80}, {NOTE_B3, 300}};
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playMarioMelody()
+{
+    // Super Mario Bros. theme opening (E E - E - C E - G - - G - -).
+    ToneDuration melody[] = {
+        {NOTE_E5, 120}, {NOTE_E5, 120}, {NOTE_SILENT, 120}, {NOTE_E5, 120}, {NOTE_SILENT, 120},
+        {NOTE_C5, 120}, {NOTE_E5, 120}, {NOTE_SILENT, 120}, {NOTE_G5, 240}, {NOTE_SILENT, 240},
+        {NOTE_G4, 240}, {NOTE_SILENT, 240},
+    };
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playFoundMelody()
+{
+    // "Level complete" success fanfare (ascending ta-da + held top note).
+    ToneDuration melody[] = {
+        {NOTE_C5, 130}, {NOTE_E5, 130}, {NOTE_G5, 130}, {NOTE_C6, 260},
+        {NOTE_G5, 130}, {NOTE_C6, 400},
+    };
     playTones(melody, sizeof(melody) / sizeof(ToneDuration));
 }

@@ -7,6 +7,7 @@
 #include "modules/OnScreenKeyboardModule.h"
 #include <functional>
 #include <string>
+#include <vector>
 #define MAX_LINES 5
 
 namespace graphics
@@ -31,6 +32,11 @@ class NotificationRenderer
     static std::function<void(const std::string &)> textInputCallback;
 
     static bool pauseBanner;
+
+    // When non-null, drawNodePicker() only lists the node nums in this list (used
+    // by the Family Tracker "lost child" picker). Reset on every showNodePicker().
+    static const std::vector<uint32_t> *nodePickerFilter;
+    static void setNodePickerFilter(const std::vector<uint32_t> *filter) { nodePickerFilter = filter; }
 
     enum BannerFont : uint8_t { BANNER_FONT_DEFAULT = 0, BANNER_FONT_SMALL, BANNER_FONT_MEDIUM, BANNER_FONT_LARGE };
 

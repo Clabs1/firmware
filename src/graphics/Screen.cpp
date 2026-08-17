@@ -348,6 +348,9 @@ void Screen::showNodePicker(const char *message, uint32_t durationMs, std::funct
     EINK_ADD_FRAMEFLAG(dispdev, DEMAND_FAST); // Skip full refresh for all overlay menus
 #endif
     nodeDB->pause_sort(true);
+    // Default: show all nodes. Family Tracker passes a specific node list just
+    // after calling this for its "lost child" picker.
+    NotificationRenderer::setNodePickerFilter(nullptr);
     // Store the message and set the expiration timestamp
     strncpy(NotificationRenderer::alertBannerMessage, message, 255);
     NotificationRenderer::alertBannerMessage[255] = '\0'; // Ensure null termination

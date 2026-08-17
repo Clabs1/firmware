@@ -90,7 +90,8 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
 
     bool wantPacket(const meshtastic_MeshPacket *p) override
     {
-        return p->decoded.portnum == meshtastic_PortNum_PRIVATE_APP;
+        return p->decoded.portnum == meshtastic_PortNum_PRIVATE_APP ||
+               p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP;
     }
 
     ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
@@ -98,6 +99,14 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     void setup() override;
 
     int handleInputEvent(const InputEvent *event);
+
+    // Handle a family command sent as a canned/free text (e.g. "come back",
+    // "found", "lost <name>"). Returns true if the text matched a command and triggered an action.
+    bool handleFamilyCommand(const char *text);
+
+    // Parent declares a child lost: broadcasts LOST_CHILD (target in payload) and
+    // also broadcasts COME_BACK so the whole group regroups. SPEC §31/§35.
+    void sendLostChild(NodeNum target);
 
     int32_t runOnce() override; // OSThread: parent watchdog tick
 
@@ -130,10 +139,22 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // on-screen message at the child). SPEC §34A.
     void sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeNum to);
 
-    // Nearest-parent direction+distance display (SPEC §35). Child with a screen
-    // shows the nearest parent's name, distance and bearing as its default
-    // on-screen status, refreshed periodically from runOnce().
-    void updateNearestParentDisplay();
+    // Parent -> all children: "come back now" (regroup) broadcast.
+    void sendComeBack();
+
+    // Parent concludes a lost/panic search: stand-down broadcast + success tone.
+    void sendFound();
+
+    // Look up a tracker-role child by long_name or short_name (case-insensitive).
+    // Returns NODENUM_BROADCAST (0) if none matched.
+    NodeNum findChildByName(const char *name);
+
+    // Handle a human-readable family command received as TEXT_MESSAGE_APP
+    // (e.g. "Child 1 is lost"). Returns STOP if consumed, else CONTINUE.
+    ProcessMessage handleTextCommand(const meshtastic_MeshPacket &mp);
+
+    // Open a tracker-only node picker so the parent can select which child is lost.
+    void pickLostChild();
 
     // Parent watchdog state
     std::vector<NodeNum> alertedMissed;
@@ -191,9 +212,6 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // T1 parent when the text loops back).
     char pendingAlert[128] = {0};
     bool alertPending = false;
-
-    // Nearest-parent display cadence.
-    uint32_t lastNearestParentMs = 0;
 };
 
 extern FamilyTrackerModule *familyTrackerModule;
