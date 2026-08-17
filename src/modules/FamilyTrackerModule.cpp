@@ -534,6 +534,14 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
         case INPUT_BROKER_USER_PRESS:
         case INPUT_BROKER_SEND_PING:
         case INPUT_BROKER_ALT_PRESS:
+            // A button press while the find sound is active cancels it (and does
+            // NOT raise a panic) - so a child/parent can silence "find me" once
+            // found without accidentally triggering a panic.
+            if (findSoundUntilMs) {
+                findSoundUntilMs = 0;
+                LOG_INFO("FamilyTracker: FIND SOUND cancelled by button");
+                break;
+            }
             if (isChild()) {
                 uint32_t eventId = nextEventId++;
                 lastPanicEventId = eventId; // so the returning ACK matches (SPEC §34)
