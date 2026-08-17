@@ -485,7 +485,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             target = (uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24);
         }
         if (isChild() && target == nodeDB->getNodeNum()) {
-            lostModeUntilMs = millis() + FAMILYTRACKER_LOST_MODE_SECS * 1000UL;
+            lostModeActive = true; // persists until a parent sends FOUND
             playComboTune();
             if (screen)
                 screen->showSimpleBanner("Lost child - stay where you are", 15000);
@@ -540,10 +540,10 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                                  ? sender->long_name
                                  : (sender && sender->short_name[0]) ? sender->short_name : "Parent";
             findSoundUntilMs = 0;
-            lostModeUntilMs = 0;
+            lostModeActive = false;
             lastPanicEventId = 0; // stand down any outstanding panic
-            sendTextAlert("STOOD DOWN: %s cancelled the alert", pn);
-            LOG_WARN("FamilyTracker: STOOD DOWN by %s (0x%08x)", pn, mp.from);
+            sendTextAlert("FOUND: %s found by %s - standing down", owner.short_name, pn);
+            LOG_WARN("FamilyTracker: FOUND %s by %s (0x%08x)", owner.short_name, pn, mp.from);
         }
         break;
 
@@ -677,9 +677,9 @@ int32_t FamilyTrackerModule::runOnce()
         }
 
         // Lost mode: much faster check-in cadence while a search is active.
-        if (lostModeUntilMs && (int32_t)(millis() - lostModeUntilMs) >= 0)
-            lostModeUntilMs = 0; // auto-expire
-        uint32_t intervalMs = lostModeUntilMs ? FAMILYTRACKER_LOST_CHECKIN_SECS * 1000UL
+        // Persists until a parent sends FOUND (no auto-timeout) - the searchers
+        // keep tracking until the child is explicitly found.
+        uint32_t intervalMs = lostModeActive ? FAMILYTRACKER_LOST_CHECKIN_SECS * 1000UL
                                              : FAMILYTRACKER_CHECKIN_INTERVAL_SECS * 1000UL;
         // Periodic check-in so the parent can monitor us even without a GPS fix.
         // Use millis() (monotonic) not getValidTime() so it works without an RTC.

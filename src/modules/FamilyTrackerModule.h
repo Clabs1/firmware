@@ -73,9 +73,8 @@
 #define FAMILYTRACKER_DEFAULT_LOW_BATTERY_PCT    20
 
 // Parent-triggered flows (parent -> child/group)
-#define FAMILYTRACKER_LOST_MODE_SECS        (10 * 60)  // child auto-exits lost mode after 10 min
 #define FAMILYTRACKER_LOST_CHECKIN_SECS     10         // fast check-in cadence while lost
-#define FAMILYTRACKER_FIND_SOUND_SECS       30         // find tone auto-stops after 30 s
+#define FAMILYTRACKER_FIND_SOUND_SECS       150        // find tone auto-stops after 2m30s
 #define FAMILYTRACKER_FIND_BEEP_INTERVAL_MS 2000       // re-beep cadence for the find sound
 
 // Child periodic check-in cadence (SPEC §13/§14/§18) - independent of GPS so the
@@ -183,8 +182,8 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     uint8_t lowBatteryPct = FAMILYTRACKER_DEFAULT_LOW_BATTERY_PCT;
 
     // Parent-triggered flows (COME_BACK / LOST_CHILD / FIND_SOUND).
-    uint32_t lostModeUntilMs = 0;  // child: fast check-in cadence until this time
-    uint32_t findSoundUntilMs = 0; // any role: re-beep the find tone until this time
+    bool lostModeActive = false;    // child: fast check-in cadence until a parent sends FOUND
+    uint32_t findSoundUntilMs = 0;  // any role: re-beep the find tone until this time
     uint32_t lastFindBeepMs = 0;
 
     // Deferred panic alert text (queued by renderPanicAlert, sent on the next
