@@ -433,6 +433,16 @@ NodeDB::NodeDB()
     owner.hw_model = HW_VENDOR;
     // Ensure user (nodeinfo) role is set to whatever we're configured to
     owner.role = config.device.role;
+#ifdef USERPREFS_CONFIG_OWNER_LONG_NAME
+    // Force the baked owner name on every boot (not just fresh install): a node
+    // reflashed with a new name (e.g. re-issued to a new child) must immediately
+    // adopt it rather than keep a stale identity from flash.
+    snprintf(owner.long_name, sizeof(owner.long_name), (const char *)USERPREFS_CONFIG_OWNER_LONG_NAME);
+    clampLongName(owner.long_name);
+#endif
+#ifdef USERPREFS_CONFIG_OWNER_SHORT_NAME
+    snprintf(owner.short_name, sizeof(owner.short_name), (const char *)USERPREFS_CONFIG_OWNER_SHORT_NAME);
+#endif
     // Ensure macaddr is set to our macaddr as it will be copied in our info below
     memcpy(owner.macaddr, ourMacAddr, sizeof(owner.macaddr));
     // Ensure owner.id is always derived from the node number

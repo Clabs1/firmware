@@ -105,12 +105,12 @@ void FamilyTrackerModule::fillBestPosition(meshtastic_PositionLite *pos, bool *h
     *hasPos = true;
 }
 
-void FamilyTrackerModule::renderPanicAlert(const meshtastic_MeshPacket &mp, uint32_t eventId,
+void FamilyTrackerModule::renderPanicAlert(NodeNum from, uint32_t eventId,
                                            const meshtastic_PositionLite &pos, bool stale, uint8_t ageMin, bool hasPos)
 {
     // Child identity (SPEC §18A multi-child): name from the child's nodedb entry.
     const char *childName = nullptr;
-    const meshtastic_NodeInfoLite *child = nodeDB->getMeshNode(mp.from);
+    const meshtastic_NodeInfoLite *child = nodeDB->getMeshNode(from);
     if (child && child->long_name[0]) {
         childName = child->long_name;
     } else if (child && child->short_name[0]) {
@@ -118,7 +118,7 @@ void FamilyTrackerModule::renderPanicAlert(const meshtastic_MeshPacket &mp, uint
     }
     char nameBuf[16];
     if (!childName) {
-        snprintf(nameBuf, sizeof(nameBuf), "0x%04x", (uint16_t)mp.from);
+        snprintf(nameBuf, sizeof(nameBuf), "0x%04x", (uint16_t)from);
         childName = nameBuf;
     }
 
@@ -178,10 +178,10 @@ void FamilyTrackerModule::renderPanicAlert(const meshtastic_MeshPacket &mp, uint
         snprintf(pendingAlert, sizeof(pendingAlert), "%s pressed the panic button at %s - %s away, %d deg (%s)",
                  childName, timeStr, distStr, bearingDeg, ageStr);
         LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %.1f m away %d° (%s)", eventId, childName,
-                 (uint16_t)mp.from, distM, bearingDeg, ageStr);
+                 (uint16_t)from, distM, bearingDeg, ageStr);
     } else {
         snprintf(pendingAlert, sizeof(pendingAlert), "%s pressed the panic button at %s - %s", childName, timeStr, ageStr);
-        LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %s", eventId, childName, (uint16_t)mp.from, ageStr);
+        LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %s", eventId, childName, (uint16_t)from, ageStr);
     }
     alertPending = true;
 }
@@ -566,11 +566,17 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                 std::find(alertedPanic.begin(), alertedPanic.end(), mp.from) != alertedPanic.end();
             if (!alreadyAlerted) {
                 alertedPanic.push_back(mp.from);
-                renderPanicAlert(mp, eventId, pos, (flags & FAMILYTRACKER_FLAG_POS_STALE) != 0, ageMin,
-                                 (flags & FAMILYTRACKER_FLAG_HAS_POS) != 0);
+                // Queue the whole alert (banner + buzzer + ACK + text) for runOnce:
+                // doing it here inside the radio RX handler contends with the
+                // radio/flash SPI lock on the nRF52 and intermittently hangs.
+                pendingPanic.active = true;
+                pendingPanic.from = mp.from;
+                pendingPanic.eventId = eventId;
+                pendingPanic.pos = pos;
+                pendingPanic.stale = (flags & FAMILYTRACKER_FLAG_POS_STALE) != 0;
+                pendingPanic.ageMin = ageMin;
+                pendingPanic.hasPos = (flags & FAMILYTRACKER_FLAG_HAS_POS) != 0;
             }
-            playPanicAlert(); // alert (distinct from the child's call)
-            sendAck(eventId, mp.from); // SPEC §34 — targeted to the panicking child (multi-Child §18A)
         }
         break;
 
@@ -812,6 +818,19 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
 // Child: periodic CHECKIN heartbeat independent of GPS (SPEC §13/§14/§18).
 int32_t FamilyTrackerModule::runOnce()
 {
+    // Act on a queued panic OUTSIDE the radio RX path: banner + buzzer + ACK.
+    // renderPanicAlert() in turn queues the human-readable text (alertPending),
+    // flushed on the next tick. None of these side-effects run inside
+    // handleReceived(), which is what hangs the T1 parent.
+    if (pendingPanic.active) {
+        pendingPanic.active = false;
+        renderPanicAlert(pendingPanic.from, pendingPanic.eventId, pendingPanic.pos, pendingPanic.stale,
+                         pendingPanic.ageMin, pendingPanic.hasPos);
+        playPanicAlert(); // alert (distinct from the child's call)
+        sendAck(pendingPanic.eventId, pendingPanic.from); // SPEC §34 — targeted ACK (multi-Child §18A)
+        return 200; // fast tick so the queued text flushes promptly
+    }
+
     // Flush a deferred panic alert (queued by renderPanicAlert to avoid a
     // reentrant message-store write that hangs the T1 parent).
     if (alertPending) {

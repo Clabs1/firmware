@@ -131,7 +131,7 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
 
     // Human-readable panic rendering (SPEC §34 "family channel human-readable")
     // returns "<name> pressed the panic button at hh:mm - <dist> <dir> (<age>)"
-    void renderPanicAlert(const meshtastic_MeshPacket &mp, uint32_t eventId, const meshtastic_PositionLite &pos,
+    void renderPanicAlert(NodeNum from, uint32_t eventId, const meshtastic_PositionLite &pos,
                           bool stale, uint8_t ageMin, bool hasPos);
 
     // Send the preselected "on the way" response to a specific child: a Family
@@ -212,6 +212,20 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // T1 parent when the text loops back).
     char pendingAlert[128] = {0};
     bool alertPending = false;
+
+    // A full panic (banner + buzzer + ACK + text) is queued here and acted on in
+    // runOnce, so NO side-effect runs inside the radio RX handler. Doing banner/
+    // buzzer/TX inside handleReceived contends with the radio/flash SPI lock on
+    // the nRF52 and intermittently hangs the T1 parent.
+    struct PendingPanic {
+        bool active = false;
+        NodeNum from = 0;
+        uint32_t eventId = 0;
+        meshtastic_PositionLite pos;
+        bool stale = false;
+        uint8_t ageMin = 0;
+        bool hasPos = false;
+    } pendingPanic;
 };
 
 extern FamilyTrackerModule *familyTrackerModule;
