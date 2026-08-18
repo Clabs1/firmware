@@ -345,3 +345,22 @@ void playFoundMelody()
     };
     playTones(melody, sizeof(melody) / sizeof(ToneDuration));
 }
+
+void playMissedCheckinTone()
+{
+    // Distinct double-warning: two falling "uh-oh" pairs (BUG-002).
+    ToneDuration melody[] = {
+        {NOTE_G4, 120}, {NOTE_SILENT, 60}, {NOTE_G4, 120}, {NOTE_SILENT, 100},
+        {NOTE_E4, 120}, {NOTE_SILENT, 60}, {NOTE_E4, 120},
+    };
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playLowBatteryTone()
+{
+    // Distinct double-beep (lower, non-urgent) for a low-battery child (SPEC §23).
+    ToneDuration melody[] = {
+        {NOTE_C4, 100}, {NOTE_SILENT, 80}, {NOTE_C4, 100},
+    };
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}

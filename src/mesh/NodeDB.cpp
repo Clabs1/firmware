@@ -459,6 +459,15 @@ NodeDB::NodeDB()
     // Ensure owner.id is always derived from the node number
     snprintf(owner.id, sizeof(owner.id), "!%08x", getNodeNum());
 
+    // Buzzer policy forced on EVERY boot (mirrors the role/name overrides):
+    // automated test builds (FAMILY_TEST_HOOKS) are silent so the hands-off rig
+    // doesn't beep; field/human builds force ALL_ENABLED from USERPREFS.
+#ifdef FAMILY_TEST_HOOKS
+    config.device.buzzer_mode = meshtastic_Config_DeviceConfig_BuzzerMode_DISABLED;
+#elif defined(USERPREFS_CONFIG_DEVICE_BUZZER_MODE)
+    config.device.buzzer_mode = USERPREFS_CONFIG_DEVICE_BUZZER_MODE;
+#endif
+
     if (!config.has_security) {
         config.has_security = true;
         config.security = meshtastic_Config_SecurityConfig_init_default;
@@ -931,7 +940,10 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT; // Default to client.
 #endif
 
-#ifdef USERPREFS_CONFIG_DEVICE_BUZZER_MODE
+#ifdef FAMILY_TEST_HOOKS
+    // Test builds stay silent even across a factory reset (see the ctor force).
+    config.device.buzzer_mode = meshtastic_Config_DeviceConfig_BuzzerMode_DISABLED;
+#elif defined(USERPREFS_CONFIG_DEVICE_BUZZER_MODE)
     config.device.buzzer_mode = USERPREFS_CONFIG_DEVICE_BUZZER_MODE;
 #endif
 

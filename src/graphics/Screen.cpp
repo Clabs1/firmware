@@ -81,6 +81,7 @@ extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
 #include "mesh/Default.h"
 #include "mesh/generated/meshtastic/deviceonly.pb.h"
 #include "modules/ExternalNotificationModule.h"
+#include "modules/FamilyTrackerModule.h" // BUG-010: child default frame
 #if BASEUI_HAS_GAMES
 #include "modules/games/GamesModule.h"
 #endif
@@ -1607,7 +1608,13 @@ void Screen::setFrames(FrameFocus focus)
     // Focus on a specific frame, in the frame set we just created
     switch (focus) {
     case FOCUS_DEFAULT:
-        ui->switchToFrame(fsi.positions.deviceFocused);
+        // BUG-010/ENH-010: a screen-equipped child tracker boots into the
+        // Position/GPS navigation frame (nearest-parent banner overlays it).
+        if (familyTrackerModule && familyTrackerModule->isChild() && fsi.positions.gps != 255) {
+            ui->switchToFrame(fsi.positions.gps);
+        } else {
+            ui->switchToFrame(fsi.positions.deviceFocused);
+        }
         break;
     case FOCUS_FAULT:
         ui->switchToFrame(fsi.positions.fault);

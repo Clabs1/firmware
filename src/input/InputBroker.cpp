@@ -4,6 +4,7 @@
 #include "graphics/Screen.h"
 #include "input/HapticFeedback.h"
 #include "modules/ExternalNotificationModule.h"
+#include "modules/FamilyTrackerModule.h" // BUG-014: child wake-press priority
 #ifdef MESHTASTIC_LOCKDOWN
 #include "security/LockdownDisplay.h"
 #endif
@@ -127,8 +128,13 @@ int InputBroker::handleInputEvent(const InputEvent *event)
 
 #if HAS_SCREEN
     if (screen && screenWasOff) {
-        // If the screen was off, it is in the process of turning on, and we just drop the event
-        return 0;
+        // If the screen was off, it is in the process of turning on, and we just
+        // drop the event. EXCEPT for a child-tracker role (BUG-014/ENH-011):
+        // the first physical press must fire the panic immediately - display
+        // wake must not consume it - so route it through to observers.
+        if (!(familyTrackerModule && familyTrackerModule->consumesWakeupPress())) {
+            return 0;
+        }
     }
 #endif
 
@@ -434,7 +440,11 @@ void InputBroker::Init()
         userConfigNoScreen.longPressTime = 500;
         userConfigNoScreen.longLongPress = INPUT_BROKER_SHUTDOWN;
         userConfigNoScreen.doublePress = INPUT_BROKER_SEND_PING;
-        userConfigNoScreen.triplePress = INPUT_BROKER_GPS_TOGGLE;
+        // ENH-003: the screenless child's triple press must be a no-op - it would
+        // otherwise toggle GPS (the default), defeating the one-press panic UX.
+        userConfigNoScreen.triplePress = (familyTrackerModule && familyTrackerModule->isChild())
+                                             ? INPUT_BROKER_NONE
+                                             : INPUT_BROKER_GPS_TOGGLE;
         UserButtonThread->initButton(userConfigNoScreen);
     }
 #endif // ELECROW_ThinkNode_M8

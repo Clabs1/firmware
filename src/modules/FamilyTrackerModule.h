@@ -29,18 +29,18 @@
  *   - missed-check-in watchdog: per-child, alert if sinceLastSeen > timeout
  *   - low-battery alert from child telemetry
  *
- * Payload v0.2 (max 21 bytes):
- *   byte 0      : protocol version (0x02 = v0.2, stays < v1)
- *   byte 1      : msg type (0x01 PANIC, 0x02 PANIC_ACK, 0x03 LOCATE_REQ, 0x04 LOCATE_RESP)
+ * Payload v0.3 (max 22 bytes):
+ *   byte 0      : protocol version (0x03 = v0.3, stays < v1)
+ *   byte 1      : msg type
  *   bytes 2-5   : event id (uint32 LE)
  *   byte 6      : flags (bit0 HAS_POS, bit1 POS_STALE)
  *   byte 7      : pos_age_minutes
- *   bytes 8-11  : latitude_i (int32 LE)   [if HAS_POS]
- *   bytes 12-15 : longitude_i (int32 LE)  [if HAS_POS]
- *   bytes 16-17 : altitude (int16 LE)     [if HAS_POS]
- *   bytes 18-19 : battery (uint16 LE)     [if available]
+ *   bytes 8-11  : event timestamp (uint32 LE, UTC epoch secs) - child-authoritative
+ *   bytes 12-15 : latitude_i (int32 LE)   [if HAS_POS]
+ *   bytes 16-19 : longitude_i (int32 LE)  [if HAS_POS]
+ *   bytes 20-21 : altitude (int16 LE)     [if HAS_POS]
  */
-#define FAMILYTRACKER_PROTOCOL_VERSION 0x02
+#define FAMILYTRACKER_PROTOCOL_VERSION 0x03
 
 #define FAMILYTRACKER_MSG_PANIC       0x01
 #define FAMILYTRACKER_MSG_PANIC_ACK   0x02
@@ -54,7 +54,8 @@
 #define FAMILYTRACKER_MSG_COME_BACK     0x0A  // parent -> child: "come back now" (tone + banner)
 #define FAMILYTRACKER_MSG_LOST_CHILD    0x0B  // parent -> group: "child X is lost" (target node in payload)
 #define FAMILYTRACKER_MSG_FIND_SOUND    0x0C  // any -> node: loud repeating find tone
-#define FAMILYTRACKER_MSG_CANCEL        0x0D  // any -> node: cancel active find-sound / lost-mode
+#define FAMILYTRACKER_MSG_CANCEL        0x0D  // any -> node: cancel active find-sound / lost-mode / panic
+#define FAMILYTRACKER_MSG_PARENT_PRESENCE 0x0E // parent -> group: startup presence + position (BUG-011)
 
 // Preselected "on the way" response messages (SPEC §34A). The parent picks one
 // and it is sent to the child as a human-readable Family Channel text plus a
@@ -81,6 +82,15 @@
 // parent can always distinguish "idle" from "missing".
 #define FAMILYTRACKER_CHECKIN_INTERVAL_SECS 120
 
+// Panic state machine (ARCH §2). Minimum time between panic triggers on the
+// child (retrigger permitted after this cooldown, fresh event ID) and the
+// dedup window for the SAME (from, eventId) on a parent (mesh retransmissions
+// must not re-alert).
+#define FAMILYTRACKER_PANIC_COOLDOWN_MS 20000
+#define FAMILYTRACKER_PANIC_DEDUP_MS    60000
+
+enum class FamilyPanicState : uint8_t { NORMAL, PANIC_ACTIVE, PANIC_CLEARED };
+
 class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThread
 {
   public:
@@ -100,6 +110,15 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
 
     int handleInputEvent(const InputEvent *event);
 
+    // Role helpers. Public so InputBroker can route the screen-wake press to a
+    // child (BUG-014) and null the screenless triple-press GPS toggle (ENH-003).
+    bool isChild() const;
+    bool isParent() const;
+
+    // Child tracker: the first physical press must fire panic even while the
+    // display is asleep (BUG-014/ENH-011).
+    bool consumesWakeupPress() const { return isChild(); }
+
     // Handle a family command sent as a canned/free text (e.g. "come back",
     // "found", "lost <name>"). Returns true if the text matched a command and triggered an action.
     bool handleFamilyCommand(const char *text);
@@ -114,9 +133,6 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
         CallbackObserver<FamilyTrackerModule, const InputEvent *>(this, &FamilyTrackerModule::handleInputEvent);
 
   private:
-    bool isChild() const;
-    bool isParent() const;
-
     void sendMessage(uint8_t msgType, uint32_t eventId, bool hasPos, bool stale, uint8_t ageMin);
     void sendMessageTo(uint8_t msgType, uint32_t eventId, bool hasPos, bool stale, uint8_t ageMin, NodeNum to);
     void sendTextAlert(const char *format, ...);
@@ -124,14 +140,19 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     void sendAck(uint32_t eventId, NodeNum to);
 
     void buzzerBeep(bool ack);
-    bool isValidMessage(const meshtastic_MeshPacket &mp, uint8_t *msgType, uint32_t *eventId, uint8_t *flags,
-                        uint8_t *ageMin, meshtastic_PositionLite *pos);
+    bool isValidMessage(const meshtastic_MeshPacket &mp, uint8_t *msgType, uint32_t *eventId, uint32_t *eventTs,
+                        uint8_t *flags, uint8_t *ageMin, meshtastic_PositionLite *pos);
     void fillBestPosition(meshtastic_PositionLite *pos, bool *hasPos, bool *stale, uint8_t *ageMin);
     void triggerFreshFix();
 
+    // Child panic send: enforces the cooldown, assigns a fresh event ID, moves
+    // to PANIC_ACTIVE, and on the first trigger also broadcasts RETURN_TO_PARENT
+    // (COME_BACK) so sibling children regroup (BUG-008/009/012/013, ARCH §2/§3).
+    void sendPanic();
+
     // Human-readable panic rendering (SPEC §34 "family channel human-readable")
     // returns "<name> pressed the panic button at hh:mm - <dist> <dir> (<age>)"
-    void renderPanicAlert(NodeNum from, uint32_t eventId, const meshtastic_PositionLite &pos,
+    void renderPanicAlert(NodeNum from, uint32_t eventId, uint32_t eventTs, const meshtastic_PositionLite &pos,
                           bool stale, uint8_t ageMin, bool hasPos);
 
     // Send the preselected "on the way" response to a specific child: a Family
@@ -159,7 +180,12 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // Parent watchdog state
     std::vector<NodeNum> alertedMissed;
     std::vector<NodeNum> alertedBattery;
-    std::vector<NodeNum> alertedPanic;   // dedup: children already alerted for
+    // Panic dedup by (from, eventId) with a time window (BUG-003/004/008): a NEW
+    // event ID always alerts again (retrigger), the SAME event ID within the
+    // dedup window (mesh retransmission) is ignored. Never a permanent per-node
+    // latch, so a child can panic repeatedly in one session.
+    std::map<NodeNum, uint32_t> lastPanicEventIdByNode;
+    std::map<NodeNum, uint32_t> lastPanicAlertMsByNode;
 
     // Direct per-child last-seen (ms, monotonic millis()). NOT nodedb lastHeard:
     // our CHECKIN/PANIC are PRIVATE_APP packets that the router consumes (STOP)
@@ -198,6 +224,16 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     uint32_t nextEventId = 1;
     uint32_t lastLocateReqAt = 0;
 
+    // Explicit panic state machine (ARCH §2, BUG-008/012/013).
+    FamilyPanicState panicState = FamilyPanicState::NORMAL;
+    uint32_t lastPanicSentMs = 0;
+
+    // Startup sync (BUG-011/ENH-007): child CHECKINs immediately on first runOnce
+    // (not after a full interval); parent broadcasts PARENT_PRESENCE once.
+    uint32_t lastCheckinMs = 0;
+    bool startupCheckinPending = true;
+    bool startupPresencePending = true;
+
     // Watchdog tuning (remote CONFIG message, FAMILYTRACKER_MSG_CONFIG).
     uint32_t missedTimeoutSecs = FAMILYTRACKER_DEFAULT_MISSED_TIMEOUT_SECS;
     uint8_t lowBatteryPct = FAMILYTRACKER_DEFAULT_LOW_BATTERY_PCT;
@@ -207,13 +243,7 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     uint32_t findSoundUntilMs = 0;  // any role: re-beep the find tone until this time
     uint32_t lastFindBeepMs = 0;
 
-    // Deferred panic alert text (queued by renderPanicAlert, sent on the next
-    // runOnce tick to avoid a reentrant message-store flash write that hangs the
-    // T1 parent when the text loops back).
-    char pendingAlert[128] = {0};
-    bool alertPending = false;
-
-    // A full panic (banner + buzzer + ACK + text) is queued here and acted on in
+    // A full panic (banner + buzzer + ACK) is queued here and acted on in
     // runOnce, so NO side-effect runs inside the radio RX handler. Doing banner/
     // buzzer/TX inside handleReceived contends with the radio/flash SPI lock on
     // the nRF52 and intermittently hangs the T1 parent.
@@ -221,11 +251,23 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
         bool active = false;
         NodeNum from = 0;
         uint32_t eventId = 0;
+        uint32_t eventTs = 0;
         meshtastic_PositionLite pos;
         bool stale = false;
         uint8_t ageMin = 0;
         bool hasPos = false;
     } pendingPanic;
+
+    // Deferred human-readable text: queueTextAlert() from the RX path must not
+    // send directly (the reentrant flash save hangs the T1); flushed by runOnce.
+    void queueTextAlert(const char *format, ...);
+    char pendingAlert[128] = {0};
+    bool alertPending = false;
+
+    // Child tracker default view (BUG-010/ENH-010): persistent banner showing
+    // the nearest known parent's distance/bearing + age, refreshed every 30 s.
+    void updateNearestParentDisplay();
+    uint32_t lastNearestParentMs = 0;
 };
 
 extern FamilyTrackerModule *familyTrackerModule;

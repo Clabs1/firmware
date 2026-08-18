@@ -94,7 +94,10 @@ void FamilyTrackerModule::fillBestPosition(meshtastic_PositionLite *pos, bool *h
     pos->altitude = localPosition.altitude;
 
     uint32_t fixTime = localPosition.timestamp > 0 ? localPosition.timestamp : localPosition.time;
-    uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, true);
+    // Age math in UTC epoch (BUG-006): localPosition.timestamp is UTC, so
+    // comparing it against a LOCAL clock (BST = UTC+1) skews the age by the TZ
+    // offset. Local time is a display concern only.
+    uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, false);
     if (fixTime > 0 && nowSecs > fixTime) {
         uint32_t ageSecs = nowSecs - fixTime;
         if (ageSecs > FAMILYTRACKER_POSITION_FRESH_SECS) {
@@ -105,7 +108,7 @@ void FamilyTrackerModule::fillBestPosition(meshtastic_PositionLite *pos, bool *h
     *hasPos = true;
 }
 
-void FamilyTrackerModule::renderPanicAlert(NodeNum from, uint32_t eventId,
+void FamilyTrackerModule::renderPanicAlert(NodeNum from, uint32_t eventId, uint32_t eventTs,
                                            const meshtastic_PositionLite &pos, bool stale, uint8_t ageMin, bool hasPos)
 {
     // Child identity (SPEC §18A multi-child): name from the child's nodedb entry.
@@ -131,17 +134,22 @@ void FamilyTrackerModule::renderPanicAlert(NodeNum from, uint32_t eventId,
         screen->showSimpleBanner(banner, 15000);
     }
 
-    // Panic time: our device RTC at receipt (hh:mm).
+    // Panic time: the child's authoritative event timestamp (UTC epoch),
+    // rendered in OUR local timezone (BUG-005/006 - immutable child event data;
+    // every parent shows the same instant).
     char timeStr[8] = "--:--";
-    uint32_t nowSecs = getValidTime(RTCQuality::RTCQualityDevice, true); // already local (TZ applied)
-    if (nowSecs) {
-        uint8_t hh = (nowSecs / 3600) % 24;
-        uint8_t mm = (nowSecs / 60) % 60;
+    if (eventTs) {
+        uint32_t utcNow = getValidTime(RTCQuality::RTCQualityDevice, false);
+        uint32_t localNow = getValidTime(RTCQuality::RTCQualityDevice, true);
+        uint32_t localEventTs = eventTs + (uint32_t)((int32_t)localNow - (int32_t)utcNow);
+        uint8_t hh = (localEventTs / 3600) % 24;
+        uint8_t mm = (localEventTs / 60) % 60;
         snprintf(timeStr, sizeof(timeStr), "%02u:%02u", hh, mm);
     }
 
     // Distance + bearing from the parent's own position (SPEC §35 geo distance,
-    // never RSSI/hops) to the child's reported position.
+    // never RSSI/hops) to the child's reported position. Parents may only ADD
+    // this presentation data - never rewrite the child's event metadata.
     float distM = -1.0f;
     int bearingDeg = -1;
     const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
@@ -172,18 +180,14 @@ void FamilyTrackerModule::renderPanicAlert(NodeNum from, uint32_t eventId,
             snprintf(distStr, sizeof(distStr), "%.0f m", distM);
         else
             snprintf(distStr, sizeof(distStr), "%.1f km", distM / 1000.0f);
-        // Defer the text send: sending TEXT_MESSAGE_APP from inside the RX path
-        // makes the packet loop back and re-enter the message store, whose flash
-        // save nests spiLock and hangs the (T1) parent. Queue for runOnce().
-        snprintf(pendingAlert, sizeof(pendingAlert), "%s pressed the panic button at %s - %s away, %d deg (%s)",
-                 childName, timeStr, distStr, bearingDeg, ageStr);
-        LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %.1f m away %d° (%s)", eventId, childName,
-                 (uint16_t)from, distM, bearingDeg, ageStr);
+        // Log-only: the child already broadcast ONE authoritative human-readable
+        // text. A per-parent rebroadcast here is exactly what BUG-004 forbids.
+        LOG_WARN("FamilyTracker: PANIC event=%u ts=%u from %s (0x%04x) - %.1f m away %d deg (%s)", eventId, eventTs,
+                 childName, (uint16_t)from, distM, bearingDeg, ageStr);
     } else {
-        snprintf(pendingAlert, sizeof(pendingAlert), "%s pressed the panic button at %s - %s", childName, timeStr, ageStr);
-        LOG_WARN("FamilyTracker: PANIC event=%u from %s (%s) - %s", eventId, childName, (uint16_t)from, ageStr);
+        LOG_WARN("FamilyTracker: PANIC event=%u ts=%u from %s (0x%04x) - %s", eventId, eventTs, childName, (uint16_t)from,
+                 ageStr);
     }
-    alertPending = true;
 }
 
 void FamilyTrackerModule::sendMessage(uint8_t msgType, uint32_t eventId, bool hasPos, bool stale, uint8_t ageMin)
@@ -207,7 +211,11 @@ void FamilyTrackerModule::sendMessageTo(uint8_t msgType, uint32_t eventId, bool 
             ageMin = am;
     }
 
-    uint8_t payload[21] = {0};
+    // Event timestamp: UTC epoch at send time, captured by the ORIGINATOR so the
+    // event data stays immutable across the mesh (BUG-005, ARCH §1/§5).
+    uint32_t eventTs = getValidTime(RTCQuality::RTCQualityDevice, false);
+
+    uint8_t payload[22] = {0};
     uint8_t flags = 0;
     if (hasPos)
         flags |= FAMILYTRACKER_FLAG_HAS_POS;
@@ -222,19 +230,23 @@ void FamilyTrackerModule::sendMessageTo(uint8_t msgType, uint32_t eventId, bool 
     payload[5] = (eventId >> 24) & 0xFF;
     payload[6] = flags;
     payload[7] = ageMin;
-    size_t len = 8;
+    payload[8] = eventTs & 0xFF;
+    payload[9] = (eventTs >> 8) & 0xFF;
+    payload[10] = (eventTs >> 16) & 0xFF;
+    payload[11] = (eventTs >> 24) & 0xFF;
+    size_t len = 12;
     if (hasPos) {
-        payload[8] = pos.latitude_i & 0xFF;
-        payload[9] = (pos.latitude_i >> 8) & 0xFF;
-        payload[10] = (pos.latitude_i >> 16) & 0xFF;
-        payload[11] = (pos.latitude_i >> 24) & 0xFF;
-        payload[12] = pos.longitude_i & 0xFF;
-        payload[13] = (pos.longitude_i >> 8) & 0xFF;
-        payload[14] = (pos.longitude_i >> 16) & 0xFF;
-        payload[15] = (pos.longitude_i >> 24) & 0xFF;
-        payload[16] = pos.altitude & 0xFF;
-        payload[17] = (pos.altitude >> 8) & 0xFF;
-        len = 18;
+        payload[12] = pos.latitude_i & 0xFF;
+        payload[13] = (pos.latitude_i >> 8) & 0xFF;
+        payload[14] = (pos.latitude_i >> 16) & 0xFF;
+        payload[15] = (pos.latitude_i >> 24) & 0xFF;
+        payload[16] = pos.longitude_i & 0xFF;
+        payload[17] = (pos.longitude_i >> 8) & 0xFF;
+        payload[18] = (pos.longitude_i >> 16) & 0xFF;
+        payload[19] = (pos.longitude_i >> 24) & 0xFF;
+        payload[20] = pos.altitude & 0xFF;
+        payload[21] = (pos.altitude >> 8) & 0xFF;
+        len = 22;
     }
 
     meshtastic_MeshPacket *p = allocDataPacket();
@@ -249,8 +261,8 @@ void FamilyTrackerModule::sendMessageTo(uint8_t msgType, uint32_t eventId, bool 
     if (msgType == FAMILYTRACKER_MSG_PANIC)
         playPanicCall(); // SENT tone - three short "call" notes (SPEC §33)
 
-    LOG_INFO("FamilyTracker: TX msg=%u event=%u to=%04x%s%s", msgType, eventId, (uint16_t)to, hasPos ? " pos" : "",
-             stale ? " (stale)" : "");
+    LOG_INFO("FamilyTracker: TX msg=%u event=%u ts=%u to=%04x%s%s", msgType, eventId, eventTs, (uint16_t)to,
+             hasPos ? " pos" : "", stale ? " (stale)" : "");
 }
 
 void FamilyTrackerModule::sendAck(uint32_t eventId, NodeNum to)
@@ -261,6 +273,42 @@ void FamilyTrackerModule::sendAck(uint32_t eventId, NodeNum to)
     sendMessageTo(FAMILYTRACKER_MSG_PANIC_ACK, eventId, false, false, 0, to);
 }
 
+void FamilyTrackerModule::sendPanic()
+{
+    uint32_t nowMs = millis();
+    // Cooldown/retrigger (BUG-008, ARCH §2): a fresh panic requires a new event
+    // ID and is throttled so a held/rapid button can't flood the mesh.
+    if (panicState != FamilyPanicState::NORMAL && (nowMs - lastPanicSentMs < FAMILYTRACKER_PANIC_COOLDOWN_MS)) {
+        LOG_INFO("FamilyTracker: panic suppressed (cooldown %lu ms)", (unsigned long)(nowMs - lastPanicSentMs));
+        return;
+    }
+    bool firstTrigger = (panicState != FamilyPanicState::PANIC_ACTIVE);
+    if (panicState == FamilyPanicState::PANIC_CLEARED)
+        panicState = FamilyPanicState::NORMAL;
+    uint32_t eventId = nextEventId++;
+    lastPanicEventId = eventId;
+    lastPanicSentMs = nowMs;
+    panicState = FamilyPanicState::PANIC_ACTIVE;
+    sendMessage(FAMILYTRACKER_MSG_PANIC, eventId, true, false, 0);
+
+    // ONE authoritative human-readable broadcast (BUG-004): the child owns the
+    // panic narrative; parents never regenerate it. Deferred to runOnce because
+    // sendPanic can run inside the radio RX path (PANIC_TRIGGER).
+    char timeStr[8] = "--:--";
+    uint32_t localNow = getValidTime(RTCQuality::RTCQualityDevice, true);
+    if (localNow) {
+        uint8_t hh = (localNow / 3600) % 24;
+        uint8_t mm = (localNow / 60) % 60;
+        snprintf(timeStr, sizeof(timeStr), "%02u:%02u", hh, mm);
+    }
+    queueTextAlert("%s PANIC button pressed at %s", owner.long_name, timeStr);
+
+    // Sibling children receive RETURN_TO_PARENT once (BUG-009/ARCH §3) so the
+    // whole group regroups, not just the panicking child.
+    if (firstTrigger)
+        sendComeBack();
+}
+
 void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeNum to)
 {
     if (presetIndex >= FAMILYTRACKER_ON_WAY_COUNT)
@@ -269,9 +317,10 @@ void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeN
 
     // 1) Human-readable Family Channel text (SPEC §34A) so the whole family
     //    (and any parent console/app) sees who responded and what they said.
+    //    Deferred: ON_WAY_TRIGGER calls us from the RX path.
     char buf[128];
     snprintf(buf, sizeof(buf), "%s: %s", owner.short_name, msg);
-    sendTextAlert("%s", buf);
+    queueTextAlert("%s", buf);
 
     // 2) PARENT_ON_WAY datagram, targeted to the child: distinct tone + on-screen
     //    message at the child. presetIndex rides in the ageMin byte.
@@ -391,13 +440,19 @@ void FamilyTrackerModule::sendLostChild(NodeNum target)
     if (!p)
         return;
 
-    uint8_t payload[12] = {0};
+    // v0.3 layout: bytes 2-5 eventId, 6 flags, 7 ageMin, 8-11 eventTs, 12-15 target.
+    uint8_t payload[16] = {0};
     payload[0] = FAMILYTRACKER_PROTOCOL_VERSION;
     payload[1] = FAMILYTRACKER_MSG_LOST_CHILD;
-    payload[8] = target & 0xFF;
-    payload[9] = (target >> 8) & 0xFF;
-    payload[10] = (target >> 16) & 0xFF;
-    payload[11] = (target >> 24) & 0xFF;
+    uint32_t eventTs = getValidTime(RTCQuality::RTCQualityDevice, false);
+    payload[8] = eventTs & 0xFF;
+    payload[9] = (eventTs >> 8) & 0xFF;
+    payload[10] = (eventTs >> 16) & 0xFF;
+    payload[11] = (eventTs >> 24) & 0xFF;
+    payload[12] = target & 0xFF;
+    payload[13] = (target >> 8) & 0xFF;
+    payload[14] = (target >> 16) & 0xFF;
+    payload[15] = (target >> 24) & 0xFF;
     p->to = NODENUM_BROADCAST;
     p->decoded.payload.size = sizeof(payload);
     memcpy(p->decoded.payload.bytes, payload, sizeof(payload));
@@ -434,11 +489,25 @@ void FamilyTrackerModule::sendTextAlert(const char *format, ...)
     LOG_INFO("FamilyTracker: TEXT alert: %s", buf);
 }
 
+void FamilyTrackerModule::queueTextAlert(const char *format, ...)
+{
+    // Deferred by one runOnce tick: sending TEXT_MESSAGE_APP from inside the RX
+    // path loops the packet back into the message store, whose flash save nests
+    // spiLock and hangs the T1. Safe from the main thread too (just a member
+    // write) so it is used for every RX-path text.
+    va_list args;
+    va_start(args, format);
+    vsnprintf(pendingAlert, sizeof(pendingAlert), format, args);
+    va_end(args);
+    alertPending = true;
+}
+
 bool FamilyTrackerModule::isValidMessage(const meshtastic_MeshPacket &mp, uint8_t *msgType, uint32_t *eventId,
-                                         uint8_t *flags, uint8_t *ageMin, meshtastic_PositionLite *pos)
+                                         uint32_t *eventTs, uint8_t *flags, uint8_t *ageMin,
+                                         meshtastic_PositionLite *pos)
 {
     const uint8_t *b = mp.decoded.payload.bytes;
-    if (mp.decoded.payload.size < 8)
+    if (mp.decoded.payload.size < 12)
         return false;
     if (b[0] != FAMILYTRACKER_PROTOCOL_VERSION)
         return false;
@@ -447,13 +516,15 @@ bool FamilyTrackerModule::isValidMessage(const meshtastic_MeshPacket &mp, uint8_
     *eventId = (uint32_t)b[2] | ((uint32_t)b[3] << 8) | ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 24);
     *flags = b[6];
     *ageMin = b[7];
+    *eventTs = (uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24);
     memset(pos, 0, sizeof(*pos));
 
-    if ((*flags & FAMILYTRACKER_FLAG_HAS_POS) && mp.decoded.payload.size >= 18) {
-        pos->latitude_i = (int32_t)((uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24));
-        pos->longitude_i = (int32_t)((uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) |
-                                     ((uint32_t)b[15] << 24));
-        pos->altitude = (int16_t)((uint16_t)b[16] | ((uint16_t)b[17] << 8));
+    if ((*flags & FAMILYTRACKER_FLAG_HAS_POS) && mp.decoded.payload.size >= 22) {
+        pos->latitude_i = (int32_t)((uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) |
+                                    ((uint32_t)b[15] << 24));
+        pos->longitude_i = (int32_t)((uint32_t)b[16] | ((uint32_t)b[17] << 8) | ((uint32_t)b[18] << 16) |
+                                     ((uint32_t)b[19] << 24));
+        pos->altitude = (int16_t)((uint16_t)b[20] | ((uint16_t)b[21] << 8));
     }
     return true;
 }
@@ -511,7 +582,7 @@ ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacke
         sendLostChild(target);
         return ProcessMessage::STOP;
     }
-    sendTextAlert("No child named \"%s\" found", src);
+    queueTextAlert("No child named \"%s\" found", src);
     return ProcessMessage::STOP;
 }
 
@@ -531,7 +602,7 @@ void FamilyTrackerModule::pickLostChild()
             lostChildList.push_back(kv.first);
     }
     if (lostChildList.empty()) {
-        sendTextAlert("No children have checked in yet");
+        queueTextAlert("No children have checked in yet");
         return;
     }
 
@@ -544,34 +615,86 @@ void FamilyTrackerModule::pickLostChild()
 #endif
 }
 
+// True for texts the family module itself generates (panic announcement, missed
+// check-in, found, on-the-way, ...). Consumed in handleReceived so these never
+// also trip the generic Meshtastic notification tone (BUG-002/003/004, ARCH §4).
+static bool isFamilyAlertText(const meshtastic_MeshPacket &mp)
+{
+    char buf[120];
+    size_t len = mp.decoded.payload.size;
+    if (len >= sizeof(buf))
+        len = sizeof(buf) - 1;
+    memcpy(buf, mp.decoded.payload.bytes, len);
+    buf[len] = '\0';
+
+    static const char *const prefixes[] = {
+        "MISSED CHECK-IN: ",
+        "CHECK-IN RESUMED: ",
+        "LOW BATTERY: ",
+        "FOUND: ",
+        "No child named \"",
+        "No children have checked in yet",
+    };
+    for (const char *p : prefixes)
+        if (strncasecmp(buf, p, strlen(p)) == 0)
+            return true;
+
+    if (findNoCase(buf, "PANIC button pressed at") || findNoCase(buf, " is lost - please help find me"))
+        return true;
+    // Parent "on the way" responses: "<short>: On my way!" etc.
+    for (int i = 0; i < FAMILYTRACKER_ON_WAY_COUNT; i++)
+        if (findNoCase(buf, familyTrackerOnWayMessages[i]))
+            return true;
+    return false;
+}
+
 ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
     // Human-readable family commands ("Child 1 is lost") arrive as text.
-    if (mp.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP)
-        return handleTextCommand(mp);
+    if (mp.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+        // Consume OUR OWN alert texts first (BUG-004/009): the child's
+        // "Alice is lost - please help find me" contains " is lost", so it must
+        // never re-enter command matching (that would loop LOST_CHILD -> text ->
+        // LOST_CHILD...). This also suppresses the generic Meshtastic tone for
+        // every family alert (BUG-002/003/004, ARCH §4) while the message still
+        // displays (TextMessageModule already stored it).
+        if (isFamilyAlertText(mp))
+            return ProcessMessage::STOP;
+        ProcessMessage r = handleTextCommand(mp);
+        if (r == ProcessMessage::STOP)
+            return r;
+        return ProcessMessage::CONTINUE;
+    }
 
     uint8_t msgType, flags, ageMin;
-    uint32_t eventId;
+    uint32_t eventId, eventTs;
     meshtastic_PositionLite pos;
-    if (!isValidMessage(mp, &msgType, &eventId, &flags, &ageMin, &pos))
+    if (!isValidMessage(mp, &msgType, &eventId, &eventTs, &flags, &ageMin, &pos))
         return ProcessMessage::CONTINUE;
 
     switch (msgType) {
-    case FAMILYTRACKER_MSG_PANIC:
-        // A child panicked. Parents alert + ACK; children ignore (only one parent needed).
+    case FAMILYTRACKER_MSG_PANIC: {
+        // A child panicked. Parents alert + ACK; children ignore.
         lastPanicEventId = eventId;
         if (isParent()) {
             markChildSeen(mp.from, millis()); // panic is also proof-of-life (SPEC §18)
-            bool alreadyAlerted =
-                std::find(alertedPanic.begin(), alertedPanic.end(), mp.from) != alertedPanic.end();
+            // Dedup by (from, eventId) within a window (BUG-003/004/008): the
+            // SAME event retransmitted by the mesh must not re-alert, but a
+            // FRESH event (retrigger) always does.
+            uint32_t nowMs = millis();
+            auto it = lastPanicEventIdByNode.find(mp.from);
+            bool alreadyAlerted = it != lastPanicEventIdByNode.end() && it->second == eventId &&
+                                  (nowMs - lastPanicAlertMsByNode[mp.from] < FAMILYTRACKER_PANIC_DEDUP_MS);
             if (!alreadyAlerted) {
-                alertedPanic.push_back(mp.from);
-                // Queue the whole alert (banner + buzzer + ACK + text) for runOnce:
+                lastPanicEventIdByNode[mp.from] = eventId;
+                lastPanicAlertMsByNode[mp.from] = nowMs;
+                // Queue the whole alert (banner + buzzer + ACK) for runOnce:
                 // doing it here inside the radio RX handler contends with the
                 // radio/flash SPI lock on the nRF52 and intermittently hangs.
                 pendingPanic.active = true;
                 pendingPanic.from = mp.from;
                 pendingPanic.eventId = eventId;
+                pendingPanic.eventTs = eventTs;
                 pendingPanic.pos = pos;
                 pendingPanic.stale = (flags & FAMILYTRACKER_FLAG_POS_STALE) != 0;
                 pendingPanic.ageMin = ageMin;
@@ -579,6 +702,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             }
         }
         break;
+    }
 
     case FAMILYTRACKER_MSG_PANIC_ACK:
         // Our panic was acknowledged: ACKED tone (SPEC §34)
@@ -642,9 +766,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         // button (SPEC §32); also enables parent-initiated drills.
         if (isChild()) {
             LOG_INFO("FamilyTracker: PANIC_TRIGGER from 0x%08x -> panic", mp.from);
-            uint32_t pe = nextEventId++;
-            lastPanicEventId = pe; // so the returning ACK matches (SPEC §34)
-            sendMessage(FAMILYTRACKER_MSG_PANIC, pe, true, false, 0);
+            sendPanic();
         }
         break;
 #endif
@@ -672,11 +794,11 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
     case FAMILYTRACKER_MSG_CONFIG: {
         // Remote test-config: set the parent watchdog timeout + low-battery
         // threshold so §18/§20/§23 can be exercised without a 10-min wait.
-        // payload byte 7 = timeout in seconds (0 = leave unchanged),
-        // byte 8   = low-battery percent (0 = leave unchanged).
-        if (isParent() && mp.decoded.payload.size >= 9) {
+        // v0.3 layout: payload byte 7 = timeout in seconds (0 = leave
+        // unchanged), byte 12 = low-battery percent (0 = leave unchanged).
+        if (isParent() && mp.decoded.payload.size >= 13) {
             uint8_t t = mp.decoded.payload.bytes[7];
-            uint8_t b = mp.decoded.payload.bytes[8];
+            uint8_t b = mp.decoded.payload.bytes[12];
             if (t > 0) {
                 missedTimeoutSecs = max((uint32_t)30, (uint32_t)t);
                 LOG_WARN("FamilyTracker: CONFIG timeout_s -> %u", missedTimeoutSecs);
@@ -691,8 +813,10 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
 #endif
 
     case FAMILYTRACKER_MSG_COME_BACK:
-        // Parent -> child: "come back now". Distinct tone + on-screen message.
-        if (isChild() && (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to))) {
+        // Parent -> child (or sibling child -> group, BUG-009): "return to
+        // parent". Distinct tone + on-screen message. A child ignores its own
+        // RETURN_TO_PARENT loopback so the panicking child isn't double-tuned.
+        if (mp.from != nodeDB->getNodeNum() && isChild() && (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to))) {
             playMarioMelody(); // distinct "come back" tune (SPEC §34A)
             if (screen)
                 screen->showSimpleBanner("Come back now!", 8000);
@@ -702,12 +826,12 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
 
     case FAMILYTRACKER_MSG_LOST_CHILD: {
         // Parent -> group: "child X is lost". Target node rides in payload
-        // bytes 8-11 (uint32 LE). The target child enters lost mode (fast
-        // check-in) and announces itself; parents raise a local alert.
+        // bytes 12-15 (uint32 LE, v0.3 layout). The target child enters lost
+        // mode (fast check-in) and announces itself; parents raise a local alert.
         uint32_t target = 0;
-        if (mp.decoded.payload.size >= 12) {
+        if (mp.decoded.payload.size >= 16) {
             const uint8_t *b = mp.decoded.payload.bytes;
-            target = (uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24);
+            target = (uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
         }
         if (isChild() && target == nodeDB->getNodeNum()) {
             lostModeActive = true; // persists until a parent sends FOUND
@@ -716,7 +840,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                 screen->showSimpleBanner("Lost child - stay where you are", 15000);
             char lost[64];
             snprintf(lost, sizeof(lost), "%s is lost - please help find me", owner.short_name);
-            sendTextAlert("%s", lost);
+            queueTextAlert("%s", lost); // deferred: RX-path text would re-enter the message store
             LOG_WARN("FamilyTracker: LOST CHILD (me) - entering lost mode");
         } else if (isParent()) {
             const meshtastic_NodeInfoLite *c = nodeDB->getMeshNode(target);
@@ -771,12 +895,32 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             findSoundUntilMs = 0;
             lostModeActive = false;
             lastPanicEventId = 0; // stand down any outstanding panic
+            // Explicit panic state transition PANIC_ACTIVE -> PANIC_CLEARED
+            // (ARCH §2, BUG-012/013). Cooldown reset so the child can trigger a
+            // fresh panic immediately after being found.
+            if (isChild() && panicState == FamilyPanicState::PANIC_ACTIVE) {
+                panicState = FamilyPanicState::PANIC_CLEARED;
+                lastPanicSentMs = 0;
+                LOG_WARN("FamilyTracker: panic state PANIC_ACTIVE -> PANIC_CLEARED");
+            }
             playFoundMelody();    // "level complete" success tone
             if (screen)
                 screen->showSimpleBanner("Found - standing down", 8000);
             if (wasActive)
-                sendTextAlert("FOUND: %s found by %s - standing down", owner.short_name, pn);
+                queueTextAlert("FOUND: %s found by %s - standing down", owner.short_name, pn);
             LOG_WARN("FamilyTracker: FOUND by %s (0x%08x)", pn, mp.from);
+        }
+        break;
+
+    case FAMILYTRACKER_MSG_PARENT_PRESENCE:
+        // Parent startup presence + position (BUG-011/ENH-007). Children use it
+        // to seed/refresh the nearest-parent display promptly after boot. The
+        // child's nodedb also learns the parent via its standard position
+        // broadcasts, so this is informational + a warm-up only.
+        if (isChild()) {
+            LOG_INFO("FamilyTracker: PARENT PRESENCE from 0x%08x", mp.from);
+            // updateNearestParentDisplay() self-gates on GPS availability.
+            updateNearestParentDisplay();
         }
         break;
 
@@ -801,11 +945,16 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
                 LOG_INFO("FamilyTracker: FIND SOUND cancelled by button");
                 break;
             }
-            if (isChild()) {
-                uint32_t eventId = nextEventId++;
-                lastPanicEventId = eventId; // so the returning ACK matches (SPEC §34)
-                sendMessage(FAMILYTRACKER_MSG_PANIC, eventId, true, false, 0);
+            // BUG-007: while a menu/picker/keyboard overlay is up, presses drive
+            // navigation only - never panic.
+#if HAS_SCREEN
+            if (screen && graphics::NotificationRenderer::isMenuShowing()) {
+                LOG_INFO("FamilyTracker: press ignored (menu active)");
+                break;
             }
+#endif
+            if (isChild())
+                sendPanic();
             break;
         default:
             break;
@@ -819,20 +968,19 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
 int32_t FamilyTrackerModule::runOnce()
 {
     // Act on a queued panic OUTSIDE the radio RX path: banner + buzzer + ACK.
-    // renderPanicAlert() in turn queues the human-readable text (alertPending),
-    // flushed on the next tick. None of these side-effects run inside
-    // handleReceived(), which is what hangs the T1 parent.
+    // None of these side-effects run inside handleReceived(), which is what
+    // hangs the T1 parent.
     if (pendingPanic.active) {
         pendingPanic.active = false;
-        renderPanicAlert(pendingPanic.from, pendingPanic.eventId, pendingPanic.pos, pendingPanic.stale,
-                         pendingPanic.ageMin, pendingPanic.hasPos);
+        renderPanicAlert(pendingPanic.from, pendingPanic.eventId, pendingPanic.eventTs, pendingPanic.pos,
+                         pendingPanic.stale, pendingPanic.ageMin, pendingPanic.hasPos);
         playPanicAlert(); // alert (distinct from the child's call)
         sendAck(pendingPanic.eventId, pendingPanic.from); // SPEC §34 — targeted ACK (multi-Child §18A)
-        return 200; // fast tick so the queued text flushes promptly
+        return 200;
     }
 
-    // Flush a deferred panic alert (queued by renderPanicAlert to avoid a
-    // reentrant message-store write that hangs the T1 parent).
+    // Flush a deferred family text (queued by queueTextAlert from RX-path code
+    // to avoid a reentrant message-store write that hangs the T1 parent).
     if (alertPending) {
         alertPending = false;
         sendTextAlert("%s", pendingAlert);
@@ -858,17 +1006,31 @@ int32_t FamilyTrackerModule::runOnce()
                                              : FAMILYTRACKER_CHECKIN_INTERVAL_SECS * 1000UL;
         // Periodic check-in so the parent can monitor us even without a GPS fix.
         // Use millis() (monotonic) not getValidTime() so it works without an RTC.
-        static uint32_t lastCheckinMs = 0;
+        // Startup sync (BUG-011/ENH-007): CHECKIN immediately on the first tick
+        // so a rebooted child is re-established without waiting a full interval.
         uint32_t nowMs = millis();
-        if (nowMs - lastCheckinMs >= intervalMs) {
+        if (startupCheckinPending || nowMs - lastCheckinMs >= intervalMs) {
+            startupCheckinPending = false;
             lastCheckinMs = nowMs;
             sendMessage(FAMILYTRACKER_MSG_CHECKIN, 0, true, false, 0);
+        }
+        // Child tracker default view (BUG-010/ENH-010): nearest-parent banner.
+        if (screen && nowMs - lastNearestParentMs >= 30000UL) {
+            lastNearestParentMs = nowMs;
+            updateNearestParentDisplay();
         }
         return 5000;
     }
 
     if (!isParent())
         return 5000;
+
+    // Parent startup presence (BUG-011/ENH-007): announce + position once so a
+    // child rebooted into an empty mesh learns about us promptly.
+    if (startupPresencePending) {
+        startupPresencePending = false;
+        sendMessage(FAMILYTRACKER_MSG_PARENT_PRESENCE, 0, true, false, 0);
+    }
 
     uint32_t timeoutSecs = missedTimeoutSecs;
     uint8_t lowBatPct = lowBatteryPct;
@@ -884,23 +1046,24 @@ int32_t FamilyTrackerModule::runOnce()
         if (n->role != meshtastic_Config_DeviceConfig_Role_TRACKER)
             continue;
 
+        // Session-aware watchdog (BUG-001, ARCH §8): a child only becomes
+        // monitored after it has checked in THIS session. Never fall back to
+        // persisted nodedb lastHeard - a stale pre-reboot timestamp must not
+        // produce a false "missed check-in".
         uint32_t age = msSinceChildSeen(n->num);
-        if (age == UINT32_MAX) {
-            // Never seen via our protocol; fall back to nodedb lastHeard so a
-            // stock-broadcast child (position/nodeinfo only) is still monitored.
-            age = sinceLastSeen(n);
-        }
-        bool missed = (age != UINT32_MAX) && (age > (uint32_t)timeoutSecs * 1000UL);
+        if (age == UINT32_MAX)
+            continue;
+        bool missed = age > (uint32_t)timeoutSecs * 1000UL;
 
         bool wasMissed = std::find(alertedMissed.begin(), alertedMissed.end(), n->num) != alertedMissed.end();
         if (missed && !wasMissed) {
-            buzzerBeep(true);
+            playMissedCheckinTone(); // dedicated tone (BUG-002) - not the generic boop
             LOG_WARN("FamilyTracker: CHILD 0x%08x MISSED CHECK-IN (%u s ago)", n->num, age);
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
             sendTextAlert("MISSED CHECK-IN: %s missed check-in (%u s ago) - no contact", cn ? cn : "Child", age / 1000);
             alertedMissed.push_back(n->num);
         } else if (!missed && wasMissed) {
-            // Recovery (SPEC §21)
+            // Recovery (SPEC §21) - clears quickly after the startup sync check-in
             LOG_INFO("FamilyTracker: CHILD 0x%08x check-in resumed", n->num);
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
             sendTextAlert("CHECK-IN RESUMED: %s check-in resumed - contact restored", cn ? cn : "Child");
@@ -914,7 +1077,7 @@ int32_t FamilyTrackerModule::runOnce()
         if (lowBat) {
             bool wasBat = std::find(alertedBattery.begin(), alertedBattery.end(), n->num) != alertedBattery.end();
             if (!wasBat) {
-                buzzerBeep(false);
+                playLowBatteryTone(); // dedicated tone - not the generic beep
                 LOG_WARN("FamilyTracker: CHILD 0x%08x LOW BATTERY %u%%", n->num, metrics.battery_level);
                 const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
                 sendTextAlert("LOW BATTERY: %s low battery %u%%", cn ? cn : "Child", metrics.battery_level);
@@ -926,4 +1089,69 @@ int32_t FamilyTrackerModule::runOnce()
     }
 
     return 5000;
+}
+
+// Child tracker default view (BUG-010/ENH-010): persistent banner showing the
+// nearest known parent's distance + bearing + how old that parent position is.
+void FamilyTrackerModule::updateNearestParentDisplay()
+{
+#if HAS_SCREEN
+    if (!screen)
+        return;
+    const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    if (!self || !nodeDB->hasValidPosition(self)) {
+        screen->showSimpleBanner("Nearest parent: Unknown (no GPS)", 31000);
+        return;
+    }
+
+    float selfLat = localPosition.latitude_i * 1e-7f;
+    float selfLon = localPosition.longitude_i * 1e-7f;
+    float bestDistM = INFINITY;
+    int bestBearing = -1;
+    const char *bestName = nullptr;
+    const meshtastic_NodeInfoLite *bestNode = nullptr;
+    size_t count = nodeDB->getNumMeshNodes();
+    for (size_t i = 0; i < count; i++) {
+        const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+        if (!n || n->num == nodeDB->getNodeNum())
+            continue;
+        // Only parents (non-tracker roles) are navigation targets.
+        if (n->role == meshtastic_Config_DeviceConfig_Role_TRACKER ||
+            n->role == meshtastic_Config_DeviceConfig_Role_TAK_TRACKER)
+            continue;
+        if (!nodeDB->hasValidPosition(n))
+            continue;
+        meshtastic_PositionLite nPos;
+        if (!nodeDB->copyNodePosition(n->num, nPos))
+            continue;
+        float d = GeoCoord::latLongToMeter(selfLat, selfLon, nPos.latitude_i * 1e-7f, nPos.longitude_i * 1e-7f);
+        if (d < bestDistM) {
+            bestDistM = d;
+            bestBearing = (int)GeoCoord::bearing(selfLat, selfLon, nPos.latitude_i * 1e-7f, nPos.longitude_i * 1e-7f);
+            if (bestBearing < 0)
+                bestBearing += 360;
+            bestName = (n->long_name[0]) ? n->long_name : n->short_name;
+            bestNode = n;
+        }
+    }
+    if (!bestName) {
+        screen->showSimpleBanner("Nearest parent: Unknown", 31000);
+        return;
+    }
+
+    char distStr[24];
+    if (bestDistM < 1000.0f)
+        snprintf(distStr, sizeof(distStr), "%.0f m", bestDistM);
+    else
+        snprintf(distStr, sizeof(distStr), "%.1f km", bestDistM / 1000.0f);
+    uint32_t ago = sinceLastSeen(bestNode);
+    char b[64];
+    if (ago != UINT32_MAX)
+        snprintf(b, sizeof(b), "Nearest parent: %s %s %d deg (%lus ago)", bestName, distStr, bestBearing,
+                 (unsigned long)ago);
+    else
+        snprintf(b, sizeof(b), "Nearest parent: %s %s %d deg", bestName, distStr, bestBearing);
+    screen->showSimpleBanner(b, 31000);
+    LOG_INFO("FamilyTracker: nearest-parent display = %s", b);
+#endif
 }
