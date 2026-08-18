@@ -431,6 +431,17 @@ NodeDB::NodeDB()
 
     // Set our board type so we can share it with others
     owner.hw_model = HW_VENDOR;
+#ifdef USERPREFS_CONFIG_DEVICE_ROLE
+    // Force the baked role on every boot (not just fresh install), mirroring the
+    // owner-name override below: a node reflashed to a different role must take it
+    // immediately instead of keeping a stale role from flash.
+    config.device.role = USERPREFS_CONFIG_DEVICE_ROLE;
+    if (IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER,
+                  meshtastic_Config_DeviceConfig_Role_ROUTER_LATE,
+                  meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND)) {
+        config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    }
+#endif
     // Ensure user (nodeinfo) role is set to whatever we're configured to
     owner.role = config.device.role;
 #ifdef USERPREFS_CONFIG_OWNER_LONG_NAME
