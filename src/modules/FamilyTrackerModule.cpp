@@ -1,10 +1,19 @@
 #include "FamilyTrackerModule.h"
 #include "GPS.h"
 #include "NodeDB.h"
+#include "NodeInfoModule.h"
 #include "main.h" // screen
 #include "gps/RTC.h"
 #include "gps/GeoCoord.h"
 #include "buzz/buzz.h"
+
+// ENH-009 developer debug mode: compiled in only with -DFAMILY_DEBUG_CHAT=1
+// (see family_common.ini debug envs). Everywhere else FT_DEBUG(...) vanishes.
+#ifdef FAMILY_DEBUG_CHAT
+#define FT_DEBUG(...) ftDebug(__VA_ARGS__)
+#else
+#define FT_DEBUG(...)
+#endif
 #if HAS_SCREEN
 #include "graphics/draw/NotificationRenderer.h"
 #endif
@@ -52,9 +61,30 @@ bool FamilyTrackerModule::isParent() const
     return !isChild(); // CLIENT / ROUTER / ROUTER_CLIENT etc.
 }
 
+bool FamilyTrackerModule::isBase() const
+{
+    return IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER,
+                     meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT);
+}
+
 void FamilyTrackerModule::setup()
 {
-    LOG_WARN("FamilyTrackerModule: armed (role=%s)", isChild() ? "child" : "parent");
+    // A normal-message tone re-plays while the external-notification nag window
+    // is open (default 15s > the ~1.8s default RTTTL melody). Shrink it below
+    // the melody length so a message tone plays once, not ~3x.
+    // One play-through of the phone ringtone: nag window must cover the whole
+    // tune (~5 s) so the nRF52 RTTTL player never restarts it (ENH-006).
+    moduleConfig.external_notification.nag_timeout = 10;
+    if (isBase()) {
+        // Base/relay node: silence the generic message/bell tones. The family
+        // emergency tones (panic/lost-child) bypass ExternalNotification and
+        // still play.
+        moduleConfig.external_notification.alert_message_buzzer = false;
+        moduleConfig.external_notification.alert_bell_buzzer = false;
+    }
+LOG_WARN("FamilyTrackerModule: armed (role=%s)", isChild() ? "child" : isBase() ? "base" : "parent");
+    FT_DEBUG("armed role=%s hw=%d v%s node=0x%08x", isChild() ? "child" : isBase() ? "base" : "parent",
+             (int)HW_VENDOR, xstr(APP_VERSION_SHORT), (unsigned)nodeDB->getNodeNum());
 }
 
 void FamilyTrackerModule::buzzerBeep(bool ack)
@@ -64,6 +94,15 @@ void FamilyTrackerModule::buzzerBeep(bool ack)
     } else {
         playBeep();
     }
+}
+
+void FamilyTrackerModule::markParentHeard()
+{
+    // Any family packet authored by a non-tracker proves parent contact.
+    // Clears a latched "parent missing" alert so it can fire again later.
+    lastParentHeardMs = millis();
+    parentHeardEver = true;
+    parentMissingAlerted = false;
 }
 
 void FamilyTrackerModule::triggerFreshFix()
@@ -301,15 +340,49 @@ void FamilyTrackerModule::sendPanic()
         uint8_t mm = (localNow / 60) % 60;
         snprintf(timeStr, sizeof(timeStr), "%02u:%02u", hh, mm);
     }
-    queueTextAlert("%s PANIC button pressed at %s", owner.long_name, timeStr);
+    // Explicit location status (BUG-018): the announcement always states where
+    // we are (or were) - or that we don't know. Same flags the PANIC datagram
+    // carries, so chat and protocol never disagree.
+    meshtastic_PositionLite pos;
+    bool hasPos = false, stale = false;
+    uint8_t ageMin = 0;
+    fillBestPosition(&pos, &hasPos, &stale, &ageMin);
+    char locStr[40];
+    if (!hasPos)
+        snprintf(locStr, sizeof(locStr), "location unknown");
+    else if (stale && ageMin > 0)
+        snprintf(locStr, sizeof(locStr), "location %u mins old", ageMin);
+    else
+        snprintf(locStr, sizeof(locStr), "location fresh");
+    queueTextAlert("%s PANIC button pressed at %s (%s)", owner.long_name, timeStr, locStr);
+    FT_DEBUG("panic tx event=%u gps=%s", (unsigned)eventId, locStr);
 
     // Sibling children receive RETURN_TO_PARENT once (BUG-009/ARCH §3) so the
-    // whole group regroups, not just the panicking child.
+    // whole group regroups, not just the panicking child. Datagram only -
+    // ENH-007: no second chat message from this child.
     if (firstTrigger)
-        sendComeBack();
+        sendComeBackRegroup();
 }
 
-void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeNum to)
+void FamilyTrackerModule::notifySelfText(const char *fmt, ...)
+{
+    char msg[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (p) {
+        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+        p->to = nodeDB->getNodeNum();
+        p->decoded.payload.size = strnlen(msg, sizeof(msg));
+        memcpy(p->decoded.payload.bytes, msg, p->decoded.payload.size);
+        service->sendToMesh(p, RX_SRC_LOCAL, true);
+    }
+}
+
+void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeNum to, bool announce)
 {
     if (presetIndex >= FAMILYTRACKER_ON_WAY_COUNT)
         presetIndex = 0;
@@ -318,9 +391,11 @@ void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeN
     // 1) Human-readable Family Channel text (SPEC §34A) so the whole family
     //    (and any parent console/app) sees who responded and what they said.
     //    Deferred: ON_WAY_TRIGGER calls us from the RX path.
+    //    announce=false when re-firing another parent's response - no dupe text.
     char buf[128];
     snprintf(buf, sizeof(buf), "%s: %s", owner.short_name, msg);
-    queueTextAlert("%s", buf);
+    if (announce)
+        queueTextAlert("%s", buf);
 
     // 2) PARENT_ON_WAY datagram, targeted to the child: distinct tone + on-screen
     //    message at the child. presetIndex rides in the ageMin byte.
@@ -330,10 +405,47 @@ void FamilyTrackerModule::sendOnWay(uint32_t eventId, uint8_t presetIndex, NodeN
 
 void FamilyTrackerModule::sendComeBack()
 {
-    // Parent -> all children: "come back now" (regroup). Broadcast so every child
-    // hears the Mario tune + banner, not just one.
-    sendMessageTo(FAMILYTRACKER_MSG_COME_BACK, 0, false, false, 0, NODENUM_BROADCAST);
-    LOG_WARN("FamilyTracker: COME BACK broadcast by parent");
+    sendComeBackMsg(NODENUM_BROADCAST, true);
+}
+
+void FamilyTrackerModule::sendComeBackTo(NodeNum target)
+{
+    const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(target);
+    const char *cn = (n && n->long_name[0]) ? n->long_name
+                     : (n && n->short_name[0]) ? n->short_name
+                                               : "Child";
+    LOG_WARN("FamilyTracker: COME BACK targeted at 0x%08x (%s)", (unsigned)target, cn);
+    sendComeBackMsg(target, true);
+}
+
+void FamilyTrackerModule::sendComeBackRegroup()
+{
+    // Child-originated regroup (ENH-007): when THIS child panics, siblings get
+    // the return-to-parent datagram only - no family-chat text. The panicking
+    // child's own panic announcement is the single authoritative narrative
+    // (BUG-004); a second chat message just clutters the group.
+    sendComeBackMsg(NODENUM_BROADCAST, false);
+}
+
+void FamilyTrackerModule::sendComeBackMsg(NodeNum to, bool announce)
+{
+    // Parent -> children: "come back now". Datagram drives the Mario tune +
+    // banner at each child; the optional group-chat text keeps humans in the
+    // loop ("COME BACK: " is matched by isFamilyAlertText so receivers consume
+    // it without the generic tone).
+    sendMessageTo(FAMILYTRACKER_MSG_COME_BACK, 0, false, false, 0, to);
+    if (announce) {
+        if (to == NODENUM_BROADCAST)
+            queueTextAlert("COME BACK: %s says come back now", owner.short_name);
+        else {
+            const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(to);
+            const char *cn = (n && n->long_name[0]) ? n->long_name
+                             : (n && n->short_name[0]) ? n->short_name
+                                                       : "Child";
+            queueTextAlert("COME BACK: %s says %s come back now", owner.short_name, cn);
+        }
+    }
+    LOG_INFO("FamilyTracker: COME BACK to=%04x announced=%d", (uint16_t)to, announce);
 }
 
 void FamilyTrackerModule::sendFound()
@@ -342,7 +454,36 @@ void FamilyTrackerModule::sendFound()
     // clears its state and plays the "level complete" success tone. The child that
     // was actually active announces "FOUND" once (see the CANCEL handler).
     sendMessageTo(FAMILYTRACKER_MSG_CANCEL, 0, false, false, 0, NODENUM_BROADCAST);
+    lostDeclaredByUs.clear(); // global stand-down clears our declarations too
     LOG_WARN("FamilyTracker: FOUND stand-down broadcast by parent");
+}
+
+bool FamilyTrackerModule::sendFoundTo(NodeNum target)
+{
+    // Targeted stand-down ("found bob"): only that child clears; siblings are
+    // untouched. The child announces its own FOUND text (attribution-neutral).
+    sendMessageTo(FAMILYTRACKER_MSG_CANCEL, 0, false, false, 0, target);
+    LOG_WARN("FamilyTracker: FOUND targeted at 0x%08x", (unsigned)target);
+    return true;
+}
+
+size_t FamilyTrackerModule::stillMissingNames(char *out, size_t outLen)
+{
+    size_t used = 0;
+    out[0] = '\0';
+    for (NodeNum num : lostDeclaredByUs) {
+        const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(num);
+        const char *cn = (n && n->long_name[0]) ? n->long_name : (n && n->short_name[0]) ? n->short_name : nullptr;
+        if (!cn)
+            continue;
+        size_t add = strlen(cn) + 2;
+        if (used + add >= outLen)
+            break;
+        if (used)
+            out[used++] = ',', out[used++] = ' ';
+        used += snprintf(out + used, outLen - used, "%s", cn);
+    }
+    return used;
 }
 
 // Whole-word command match: the command must be followed by a non-alphanumeric
@@ -356,10 +497,31 @@ static bool matchCommand(const char *text, const char *cmd)
     return !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9');
 }
 
+// Forward-declare (defined after handleTextCommand).
+static const char *findNoCase(const char *haystack, const char *needle);
+
+// Map a parent's free-text response onto one of the preselected on-way presets.
+// Returns -1 when the text isn't an on-way response at all.
+static int onWayPresetFromText(const char *buf)
+{
+    if (findNoCase(buf, "on my way"))
+        return 0;
+    if (findNoCase(buf, "coming now") || findNoCase(buf, "coming"))
+        return 1;
+    if (findNoCase(buf, "calling for help") || findNoCase(buf, "calling help"))
+        return 2;
+    if (findNoCase(buf, "stay put") || findNoCase(buf, "stay where"))
+        return 3;
+    return -1;
+}
+
 // Extract the child name after a command, trimming surrounding whitespace and
 // trailing punctuation ("lost Alice!" -> "Alice").
 static void extractName(const char *src, char *out, size_t outLen)
 {
+    out[0] = '\0';
+    if (!src || !*src) // never read past the terminator (offset bugs would
+        return;        // otherwise scrape stale stack bytes as a "name")
     while (*src == ' ' || *src == '\t')
         src++;
     size_t n = 0;
@@ -384,10 +546,41 @@ bool FamilyTrackerModule::handleFamilyCommand(const char *text)
         text++;
 
     if (matchCommand(text, "come back")) {
+        // "come back <name>" targets one child; bare "come back" is the regroup
+        // broadcast to everyone.
+        char name[32];
+        extractName(text + 9, name, sizeof(name));
+        if (name[0]) {
+            NodeNum target = findChildByName(name);
+            if (target) {
+                sendComeBackTo(target);
+                return true;
+            }
+            unknownChildError(name);
+            return true;
+        }
         sendComeBack();
         return true;
     }
-    if (matchCommand(text, "found")) {
+        if (matchCommand(text, "found")) {
+        // "found <name>" clears ONE child; bare "found" is the global stand-down.
+        char name[32];
+        extractName(text + 5, name, sizeof(name));
+        if (name[0]) {
+            NodeNum target = findChildByName(name);
+            if (target) {
+                sendFoundTo(target);
+                if (!isBase())
+                    playFoundMelody(); // parents also hear the success tone
+                lostDeclaredByUs.erase(target);
+                char still[96];
+                if (stillMissingNames(still, sizeof(still)))
+                    sendTextAlert("STILL MISSING: %s", still);
+                return true;
+            }
+            unknownChildError(name);
+            return true;
+        }
         sendFound();
         return true;
     }
@@ -401,10 +594,34 @@ bool FamilyTrackerModule::handleFamilyCommand(const char *text)
                 sendLostChild(target);
                 return true;
             }
-            sendTextAlert("No child named \"%s\" found", name);
+            unknownChildError(name);
             return true;
         }
         pickLostChild(); // bare "lost": pick from the checked-in children
+        return true;
+    }
+
+    if (matchCommand(text, "find")) {
+        // "find <name>" - loud repeating tone on that node (dropped in grass).
+        // Falls back to the whole nodedb so a base/car unit can chirp too.
+        char name[32];
+        extractName(text + 5, name, sizeof(name));
+        if (name[0]) {
+            NodeNum target = findChildByName(name);
+            if (!target)
+                target = findAnyNodeByName(name);
+            if (target) {
+                sendFindSound(target);
+                return true;
+            }
+            unknownChildError(name);
+            return true;
+        }
+        playErrorTone();
+#if HAS_SCREEN
+        if (screen)
+            screen->showSimpleBanner("Usage: find <name>", 5000);
+#endif
         return true;
     }
     return false;
@@ -432,6 +649,52 @@ NodeNum FamilyTrackerModule::findChildByName(const char *name)
             return num;
     }
     return 0;
+}
+
+NodeNum FamilyTrackerModule::findAnyNodeByName(const char *name)
+{
+    if (!name || !*name)
+        return 0;
+    for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
+        meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+        if (!n || n->num == nodeDB->getNodeNum() || !n->num)
+            continue;
+        if ((n->long_name[0] && strcasecmp(n->long_name, name) == 0) ||
+            (n->short_name[0] && strcasecmp(n->short_name, name) == 0))
+            return n->num;
+    }
+    return 0;
+}
+
+void FamilyTrackerModule::sendFindSound(NodeNum to, bool announce)
+{
+    // Parent -> node: loud repeating find tone (locate a dropped tracker/base).
+    // Runs ~2.5 min; any button press on the target cancels it early. The
+    // announcing parent (the command's author) posts one group-chat line;
+    // re-firing parents stay silent.
+    const meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(to);
+    const char *cn = (n && n->long_name[0]) ? n->long_name
+                     : (n && n->short_name[0]) ? n->short_name
+                                               : "node";
+    sendMessageTo(FAMILYTRACKER_MSG_FIND_SOUND, 0, false, false, 0, to);
+    if (announce)
+        queueTextAlert("FIND SOUND: listen for the tune at %s", cn);
+    LOG_WARN("FamilyTracker: FIND SOUND targeted at 0x%08x (%s) announced=%d", (unsigned)to, cn, announce);
+}
+
+void FamilyTrackerModule::unknownChildError(const char *name)
+{
+    LOG_WARN("FamilyTracker: unknown child \"%s\"", name);
+    FT_DEBUG("unknown child \"%s\" - command ignored", name);
+    playErrorTone();
+#if HAS_SCREEN
+    if (screen) {
+        char banner[64];
+        snprintf(banner, sizeof(banner), "No child \"%s\"", name);
+        screen->showSimpleBanner(banner, 5000);
+    }
+#endif
+    notifySelfText("No child named \"%s\" - check spelling", name);
 }
 
 void FamilyTrackerModule::sendLostChild(NodeNum target)
@@ -495,12 +758,36 @@ void FamilyTrackerModule::queueTextAlert(const char *format, ...)
     // path loops the packet back into the message store, whose flash save nests
     // spiLock and hangs the T1. Safe from the main thread too (just a member
     // write) so it is used for every RX-path text.
+    // BUG-017: 4-slot ring buffer - a single slot dropped texts when two events
+    // queued between flushes (e.g. panic text + regroup). Overflow drops the
+    // OLDEST entry so the freshest event always survives.
     va_list args;
     va_start(args, format);
-    vsnprintf(pendingAlert, sizeof(pendingAlert), format, args);
+    vsnprintf(alertQueue[alertQueueHead], sizeof(alertQueue[0]), format, args);
     va_end(args);
-    alertPending = true;
+    alertQueueHead = (alertQueueHead + 1) % ALERT_QUEUE_LEN;
+    if (alertQueueCount < ALERT_QUEUE_LEN)
+        alertQueueCount++;
+    else
+        LOG_WARN("FamilyTracker: alert queue overflow (oldest text dropped)");
 }
+
+#ifdef FAMILY_DEBUG_CHAT
+void FamilyTrackerModule::ftDebug(const char *format, ...)
+{
+    // ENH-009 developer debug mode: echo a protocol event into family chat with
+    // a consistent "[FT] " prefix (consumed silently by every node via
+    // isFamilyAlertText, so debug lines never trip tones or command matching).
+    // Build-time gated (-DFAMILY_DEBUG_CHAT=1); release builds never compile it.
+    char buf[96];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    LOG_INFO("FamilyTracker: [FT] %s", buf);
+    queueTextAlert("[FT] %s", buf);
+}
+#endif
 
 bool FamilyTrackerModule::isValidMessage(const meshtastic_MeshPacket &mp, uint8_t *msgType, uint32_t *eventId,
                                          uint32_t *eventTs, uint8_t *flags, uint8_t *ageMin,
@@ -553,8 +840,149 @@ ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacke
     memcpy(buf, mp.decoded.payload.bytes, len);
     buf[len] = '\0';
 
+    // Dedup text-command echoes: the same command from the same sender arriving
+    // twice within 30s (mesh retransmission) fires the datagram only once.
+    static NodeNum lastCmdFrom = 0;
+    static uint32_t lastCmdMs = 0;
+    static char lastCmd[64] = {0};
+    uint32_t nowMs = millis();
+    bool isDup = (nowMs - lastCmdMs < 30000) && lastCmdFrom == mp.from &&
+                 strncasecmp(lastCmd, buf, sizeof(lastCmd)) == 0;
+    lastCmdFrom = mp.from;
+    lastCmdMs = nowMs;
+    strncpy(lastCmd, buf, sizeof(lastCmd) - 1);
+    lastCmd[sizeof(lastCmd) - 1] = '\0';
+    if (isDup)
+        return ProcessMessage::CONTINUE;
+
+    // Children can't issue parent commands via text (they might accidentally
+    // trigger "come back" on a sibling). Their texts are still displayed
+    // normally by the normal MESSAGE_TEXT path.
+    {
+        const meshtastic_NodeInfoLite *sender = nodeDB->getMeshNode(mp.from);
+        if (sender && sender->role == meshtastic_Config_DeviceConfig_Role_TRACKER)
+            return ProcessMessage::CONTINUE;
+    }
+
+    // The loopback copy of our OWN text (Router::sendLocal delivers local
+    // broadcasts back to us) is the AUTHOR's firing - it may announce in chat.
+    // Copies relayed from OTHER parents re-fire the datagram silently so the
+    // group chat isn't spammed with duplicate announcements.
+    bool authored = (mp.from == nodeDB->getNodeNum());
+
+    // "found" / "found <name>" (phone text): global stand-down, or clear ONE
+    // child. Every parent fires (idempotent); only the author announces.
+    if (matchCommand(buf, "found")) {
+        char name[32];
+        extractName(buf + 5, name, sizeof(name)); 
+        if (name[0]) {
+            NodeNum target = findChildByName(name);
+            if (target) {
+                sendFoundTo(target);
+                if (!isBase())
+                    playFoundMelody(); // parents also hear the success tone
+                lostDeclaredByUs.erase(target);
+                char still[96];
+                if (authored && stillMissingNames(still, sizeof(still)))
+                    queueTextAlert("STILL MISSING: %s", still);
+                return ProcessMessage::STOP;
+            }
+            unknownChildError(name);
+            return ProcessMessage::STOP;
+        }
+        sendFound();
+        return ProcessMessage::STOP;
+    }
+
+    // "come back" / "come back <name>" (phone text)
+    if (matchCommand(buf, "come back")) {
+        char name[32];
+        extractName(buf + 9, name, sizeof(name));
+        if (name[0]) {
+            NodeNum target = findChildByName(name);
+            if (target) {
+                if (authored)
+                    sendComeBackTo(target); // announces
+                else
+                    sendComeBackMsg(target, false); // silent datagram only
+                return ProcessMessage::STOP;
+            }
+            if (authored)
+                unknownChildError(name);
+            return ProcessMessage::STOP;
+        }
+        if (authored)
+            sendComeBack(); // announcing broadcast
+        else
+            sendComeBackMsg(NODENUM_BROADCAST, false);
+        return ProcessMessage::STOP;
+    }
+
     char name[32];
     const char *src = nullptr;
+
+    // "find <name>" (phone text): locate a dropped node by sound
+    if (matchCommand(buf, "find")) {
+        extractName(buf + 5, name, sizeof(name));
+        if (!name[0]) {
+            playErrorTone();
+#if HAS_SCREEN
+            if (screen)
+                screen->showSimpleBanner("Usage: find <name>", 5000);
+#endif
+            return ProcessMessage::STOP;
+        }
+        NodeNum target = findChildByName(name);
+        if (!target)
+            target = findAnyNodeByName(name);
+        if (target) {
+            sendFindSound(target, authored);
+            return ProcessMessage::STOP;
+        }
+        if (authored)
+            unknownChildError(name);
+        return ProcessMessage::STOP;
+    }
+
+    // "on my way" / "coming now" / "calling for help" / "stay put" (phone text):
+    // parent acknowledgement to a child in panic.
+    {
+        int preset = onWayPresetFromText(buf);
+        if (preset >= 0) {
+            // Extract the child name after the longest matching phrase, or fall
+            // back to the most recently panicking child.
+            NodeNum target = 0;
+            char nm[32] = {0};
+            const char *phrases[] = {"calling for help", "calling help", "on my way",
+                                     "coming now", "coming", "stay put", "stay where"};
+            for (const char *ph : phrases) {
+                const char *pos = findNoCase(buf, ph);
+                if (pos) {
+                    extractName(pos + strlen(ph), nm, sizeof(nm));
+                    break;
+                }
+            }
+            if (nm[0])
+                target = findChildByName(nm);
+            if (!target && nm[0])
+                target = findAnyNodeByName(nm);
+            if (!target && millis() - lastPanicChildMs < 300000)
+                target = lastPanicChild;
+            if (!target) {
+                playErrorTone();
+                if (authored) {
+                    notifySelfText("Usage: on my way <child name>");
+                }
+                return ProcessMessage::STOP;
+            }
+            uint32_t eventId = 0;
+            auto it = lastPanicEventIdByNode.find(target);
+            if (it != lastPanicEventIdByNode.end())
+                eventId = it->second;
+            sendOnWay(eventId, preset, target, authored);
+            return ProcessMessage::STOP;
+        }
+    }
 
     // "<name> is lost" (app-side canned message)
     const char *p = findNoCase(buf, " is lost");
@@ -579,10 +1007,14 @@ ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacke
 
     NodeNum target = findChildByName(src);
     if (target) {
+        if (authored)
+            lostDeclaredByUs.insert(target); // only the authoring parent tracks
         sendLostChild(target);
         return ProcessMessage::STOP;
     }
-    queueTextAlert("No child named \"%s\" found", src);
+    // Local beep/banner only - the sender resolves their own text via the
+    // loopback, so the typo-ing node gives itself the error. No channel spam.
+    unknownChildError(src);
     return ProcessMessage::STOP;
 }
 
@@ -607,8 +1039,10 @@ void FamilyTrackerModule::pickLostChild()
     }
 
     screen->showNodePicker("Select lost child", 60000, [](uint32_t num) {
-        if (familyTrackerModule && num)
+        if (familyTrackerModule && num) {
+            familyTrackerModule->lostDeclaredByUs.insert(num);
             familyTrackerModule->sendLostChild(num);
+        }
     });
     // set after showNodePicker (which resets the filter to "all nodes")
     graphics::NotificationRenderer::setNodePickerFilter(&lostChildList);
@@ -632,8 +1066,11 @@ static bool isFamilyAlertText(const meshtastic_MeshPacket &mp)
         "CHECK-IN RESUMED: ",
         "LOW BATTERY: ",
         "FOUND: ",
+        "COME BACK: ",
+        "FIND SOUND: ",
         "No child named \"",
         "No children have checked in yet",
+        "[FT] ", // ENH-009 developer debug-chat echoes
     };
     for (const char *p : prefixes)
         if (strncasecmp(buf, p, strlen(p)) == 0)
@@ -648,8 +1085,41 @@ static bool isFamilyAlertText(const meshtastic_MeshPacket &mp)
     return false;
 }
 
+// True for raw family COMMAND texts typed by humans ("found", "come back",
+// "lost Alice", "Alice is lost"). These must not trip the generic notification
+// tone either (BUG-016): the datagram already fired from the acting parent(s),
+// so the bare text is just an echo - consumed like an alert, still forwarded to
+// phones for the group chat. Only reached AFTER isFamilyAlertText returned
+// false, so generated narratives ("... is lost - please help find me") never
+// match here.
+static bool isFamilyCommandText(const meshtastic_MeshPacket &mp)
+{
+    char buf[64];
+    size_t len = mp.decoded.payload.size;
+    if (len >= sizeof(buf))
+        len = sizeof(buf) - 1;
+    memcpy(buf, mp.decoded.payload.bytes, len);
+    buf[len] = '\0';
+
+    if (matchCommand(buf, "found") || matchCommand(buf, "come back") || matchCommand(buf, "lost") ||
+        matchCommand(buf, "find"))
+        return true;
+    if (findNoCase(buf, " is lost"))
+        return true;
+    return false;
+}
+
 ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
+    // Parent-contact tracking (child watchdog mirror): any text authored by a
+    // non-tracker proves a parent is reachable.
+    if (mp.from != nodeDB->getNodeNum()) {
+        const meshtastic_NodeInfoLite *txr = nodeDB->getMeshNode(mp.from);
+        if (txr && txr->role != meshtastic_Config_DeviceConfig_Role_TRACKER &&
+            txr->role != meshtastic_Config_DeviceConfig_Role_TAK_TRACKER)
+            markParentHeard();
+    }
+
     // Human-readable family commands ("Child 1 is lost") arrive as text.
     if (mp.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
         // Consume OUR OWN alert texts first (BUG-004/009): the child's
@@ -658,11 +1128,40 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         // LOST_CHILD...). This also suppresses the generic Meshtastic tone for
         // every family alert (BUG-002/003/004, ARCH §4) while the message still
         // displays (TextMessageModule already stored it).
-        if (isFamilyAlertText(mp))
+        if (isFamilyAlertText(mp)) {
+#ifdef FAMILY_TEST_HOOKS
+            // Test builds: surface family alert texts to the phone/serial API so
+            // the automated harness can see FOUND/check-in texts, but still skip
+            // command re-entry (BUG-004 loop protection). Buzzer is OFF under
+            // FAMILY_TEST_HOOKS, so the suppressed generic tone is moot.
+            return ProcessMessage::CONTINUE;
+#else
+            // Production: forward the alert to the phone/serial API so it shows
+            // in the family group chat (same copy+queue path RoutingModule uses
+            // for every received packet), then STOP so the generic Meshtastic
+            // notification tone never also fires (BUG-002/003/004) and the text
+            // can't re-enter command matching.
+            if (auto *toPhone = packetPool.allocCopy(mp))
+                service->sendToPhone(toPhone);
             return ProcessMessage::STOP;
+#endif
+        }
         ProcessMessage r = handleTextCommand(mp);
         if (r == ProcessMessage::STOP)
             return r;
+        // Raw command echoes ("found", "come back Alice", ...): the acting
+        // parents already fired the datagrams above; consume the bare text so
+        // children don't ALSO play the generic notification tone over the
+        // family tone (BUG-016). Still forwarded to phones for group chat.
+        if (isFamilyCommandText(mp)) {
+#ifdef FAMILY_TEST_HOOKS
+            return ProcessMessage::CONTINUE;
+#else
+            if (auto *toPhone = packetPool.allocCopy(mp))
+                service->sendToPhone(toPhone);
+            return ProcessMessage::STOP;
+#endif
+        }
         return ProcessMessage::CONTINUE;
     }
 
@@ -672,10 +1171,22 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
     if (!isValidMessage(mp, &msgType, &eventId, &eventTs, &flags, &ageMin, &pos))
         return ProcessMessage::CONTINUE;
 
+    // Family datagram from a parent = parent-contact proof for the child watchdog.
+    if (mp.from != nodeDB->getNodeNum()) {
+        const meshtastic_NodeInfoLite *txr = nodeDB->getMeshNode(mp.from);
+        if (txr && txr->role != meshtastic_Config_DeviceConfig_Role_TRACKER &&
+            txr->role != meshtastic_Config_DeviceConfig_Role_TAK_TRACKER)
+            markParentHeard();
+    }
+
+    // A valid v0.3 family datagram proves the sender is family (private channel
+    // + protocol check): auto-favourite it once for the Friend-Finder/nearest-
+    // parent UI. Deferred to runOnce - set_favorite() writes node DB to flash.
+    autoFavourite(mp.from);
+
     switch (msgType) {
     case FAMILYTRACKER_MSG_PANIC: {
         // A child panicked. Parents alert + ACK; children ignore.
-        lastPanicEventId = eventId;
         if (isParent()) {
             markChildSeen(mp.from, millis()); // panic is also proof-of-life (SPEC §18)
             // Dedup by (from, eventId) within a window (BUG-003/004/008): the
@@ -699,6 +1210,13 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                 pendingPanic.stale = (flags & FAMILYTRACKER_FLAG_POS_STALE) != 0;
                 pendingPanic.ageMin = ageMin;
                 pendingPanic.hasPos = (flags & FAMILYTRACKER_FLAG_HAS_POS) != 0;
+                lastPanicChild = mp.from; // target for a quick unnamed "on my way"
+                lastPanicChildMs = nowMs;
+                FT_DEBUG("panic rx event=%u from=0x%04x pos=%s%s", (unsigned)eventId, (unsigned)mp.from,
+                         pendingPanic.hasPos ? (pendingPanic.stale ? "stale" : "fresh") : "none",
+                         alreadyAlerted ? " dup" : "");
+            } else {
+                FT_DEBUG("panic rx event=%u from=0x%04x DEDUPED", (unsigned)eventId, (unsigned)mp.from);
             }
         }
         break;
@@ -712,6 +1230,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         // when they match our own outstanding panic (backwards compat).
         if (isChild() && eventId == lastPanicEventId && (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to))) {
             playPanicResponse(); // rising "response" completes the call/response (SPEC §34)
+            FT_DEBUG("panic acked event=%u by=0x%04x", (unsigned)eventId, (unsigned)mp.from);
             LOG_INFO("FamilyTracker: PANIC ACKED event=%u from 0x%08x", eventId, mp.from);
         }
         break;
@@ -724,6 +1243,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             if (presetIndex >= FAMILYTRACKER_ON_WAY_COUNT)
                 presetIndex = 0;
             playStartMelody(); // distinct from ACKED boop (SPEC §34A)
+            FT_DEBUG("on the way rx preset=%u from=0x%04x", presetIndex, (unsigned)mp.from);
             if (screen) {
                 char banner[80];
                 snprintf(banner, sizeof(banner), "Parent on the way:\n%s", familyTrackerOnWayMessages[presetIndex]);
@@ -785,6 +1305,8 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         // directly (PRIVATE_APP doesn't update nodedb lastHeard).
         if (isParent())
             markChildSeen(mp.from, millis());
+        // No per-checkin [FT] chat line - periodic heartbeats would flood the
+        // group chat and drown real messages (LOG only).
         LOG_INFO("FamilyTracker: CHECKIN from 0x%08x%s%s", mp.from,
                  (flags & FAMILYTRACKER_FLAG_HAS_POS) ? " pos" : " (no pos)",
                  (flags & FAMILYTRACKER_FLAG_POS_STALE) ? " (stale)" : "");
@@ -817,7 +1339,13 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
         // parent". Distinct tone + on-screen message. A child ignores its own
         // RETURN_TO_PARENT loopback so the panicking child isn't double-tuned.
         if (mp.from != nodeDB->getNodeNum() && isChild() && (mp.to == nodeDB->getNodeNum() || isBroadcast(mp.to))) {
-            playMarioMelody(); // distinct "come back" tune (SPEC §34A)
+            // Both parents may fire on the same command text - play the tune
+            // once per burst (10s guard) instead of twice.
+            if (millis() - lastComeBackRxMs >= 10000UL) {
+                lastComeBackRxMs = millis();
+                playMarioMelody(); // distinct "come back" tune (SPEC §34A)
+                FT_DEBUG("come back rx from=0x%04x%s", (unsigned)mp.from, isBroadcast(mp.to) ? " (group)" : "");
+            }
             if (screen)
                 screen->showSimpleBanner("Come back now!", 8000);
             LOG_INFO("FamilyTracker: COME BACK from 0x%08x", mp.from);
@@ -834,10 +1362,20 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             target = (uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
         }
         if (isChild() && target == nodeDB->getNodeNum()) {
+            bool alreadyLost = lostModeActive;
             lostModeActive = true; // persists until a parent sends FOUND
-            playSosTone(); // SOS in morse - "you are lost"
+            if (!alreadyLost) {
+                // Use the same come-back tune as COME_BACK with the 10s guard
+                // so that both parents sending LOST_CHILD simultaneously only
+                // produces one play-through (same signal the child already knows).
+                if (millis() - lastComeBackRxMs >= 10000UL) {
+                    lastComeBackRxMs = millis();
+                    playMarioMelody();
+                    FT_DEBUG("lost mode ON (declared by 0x%04x)", (unsigned)mp.from);
+                }
+            }
             if (screen)
-                screen->showSimpleBanner("Lost child - stay where you are", 15000);
+                screen->showSimpleBanner("Lost - come back now!", 15000);
             char lost[64];
             snprintf(lost, sizeof(lost), "%s is lost - please help find me", owner.short_name);
             queueTextAlert("%s", lost); // deferred: RX-path text would re-enter the message store
@@ -850,6 +1388,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             else if (c && c->short_name[0])
                 cn = c->short_name;
             playLostAlert(); // distinct from the child's SOS
+            FT_DEBUG("lost child alert target=0x%04x", (unsigned)target);
             if (screen) {
                 char banner[80];
                 snprintf(banner, sizeof(banner), "%s is lost - look for them", cn);
@@ -888,10 +1427,13 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             const char *pn = (sender && sender->long_name[0])
                                  ? sender->long_name
                                  : (sender && sender->short_name[0]) ? sender->short_name : "Parent";
-            // Only the node that actually had an active alert announces "found"
+            // Only the node with an ACTUALLY active alert announces "found"
             // (so a broadcast stand-down doesn't make every node claim it was
-            // found). Everyone else just stands down with the success tone.
-            bool wasActive = findSoundUntilMs != 0 || lostModeActive || (isChild() && lastPanicEventId != 0);
+            // found). Explicit state machine - NOT lastPanicEventId, which a
+            // child never sets for someone else's panic (BUG: siblings used to
+            // announce FOUND for panics they only overheard).
+            bool wasActive = findSoundUntilMs != 0 || lostModeActive ||
+                             (isChild() && panicState == FamilyPanicState::PANIC_ACTIVE);
             findSoundUntilMs = 0;
             lostModeActive = false;
             lastPanicEventId = 0; // stand down any outstanding panic
@@ -901,16 +1443,36 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             if (isChild() && panicState == FamilyPanicState::PANIC_ACTIVE) {
                 panicState = FamilyPanicState::PANIC_CLEARED;
                 lastPanicSentMs = 0;
+                FT_DEBUG("panic state -> CLEARED (by 0x%04x)", (unsigned)mp.from);
                 LOG_WARN("FamilyTracker: panic state PANIC_ACTIVE -> PANIC_CLEARED");
             }
-            playFoundMelody();    // "level complete" success tone
+            if (!isBase())
+                playFoundMelody(); // "level complete" success tone
+            FT_DEBUG("found rx by=0x%04x wasActive=%d", (unsigned)mp.from, wasActive);
             if (screen)
                 screen->showSimpleBanner("Found - standing down", 8000);
             if (wasActive)
-                queueTextAlert("FOUND: %s found by %s - standing down", owner.short_name, pn);
+                queueTextAlert("FOUND: %s - standing down", owner.short_name);
             LOG_WARN("FamilyTracker: FOUND by %s (0x%08x)", pn, mp.from);
         }
         break;
+
+    case FAMILYTRACKER_MSG_MISSED_ALERT: {
+        // Another parent already reported this child missing to the group.
+        // Start our own suppression window so N parents don't spam N identical
+        // "MISSED CHECK-IN" texts (local tone still plays on our own detection).
+        uint32_t target = 0;
+        if (mp.decoded.payload.size >= 16) {
+            const uint8_t *b = mp.decoded.payload.bytes;
+            target = (uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
+        }
+        if (isParent() && target && mp.from != nodeDB->getNodeNum()) {
+            missedSuppressedUntilMs[target] = millis() + FAMILYTRACKER_MISSED_SUPPRESS_MS;
+            LOG_INFO("FamilyTracker: MISSED_ALERT child=0x%08x from 0x%08x - suppressing own group report", target,
+                     mp.from);
+        }
+        break;
+    }
 
     case FAMILYTRACKER_MSG_PARENT_PRESENCE:
         // Parent startup presence + position (BUG-011/ENH-007). Children use it
@@ -927,7 +1489,15 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
     default:
         return ProcessMessage::CONTINUE;
     }
+#ifdef FAMILY_TEST_HOOKS
+    // Test builds: forward family PRIVATE_APP frames to the phone/serial API so
+    // the automated harness can observe CHECKIN/PANIC/LOCATE_RESP/ON_WAY as they
+    // flow through the parent. Production builds consume them (STOP) to keep the
+    // family protocol private from the generic phone notification path.
+    return ProcessMessage::CONTINUE;
+#else
     return ProcessMessage::STOP;
+#endif
 }
 
 int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
@@ -975,15 +1545,104 @@ int32_t FamilyTrackerModule::runOnce()
         renderPanicAlert(pendingPanic.from, pendingPanic.eventId, pendingPanic.eventTs, pendingPanic.pos,
                          pendingPanic.stale, pendingPanic.ageMin, pendingPanic.hasPos);
         playPanicAlert(); // alert (distinct from the child's call)
+        FT_DEBUG("parent panic alarm event=%u from=0x%04x", (unsigned)pendingPanic.eventId, (unsigned)pendingPanic.from);
         sendAck(pendingPanic.eventId, pendingPanic.from); // SPEC §34 — targeted ACK (multi-Child §18A)
         return 200;
     }
 
-    // Flush a deferred family text (queued by queueTextAlert from RX-path code
+    // Flush deferred family texts (queued by queueTextAlert from RX-path code
     // to avoid a reentrant message-store write that hangs the T1 parent).
-    if (alertPending) {
-        alertPending = false;
-        sendTextAlert("%s", pendingAlert);
+    while (alertQueueCount > 0) {
+        uint8_t tail = (alertQueueHead + ALERT_QUEUE_LEN - alertQueueCount) % ALERT_QUEUE_LEN;
+        char buf[sizeof(alertQueue[0])];
+        memcpy(buf, alertQueue[tail], sizeof(buf));
+        alertQueueCount--;
+        sendTextAlert("%s", buf);
+    }
+
+    // One-shot startup announce (BUG-011): broadcast a standard NodeInfo so
+    // phones/node-lists show a fresh "last updated" immediately, alongside the
+    // family-level CHECKIN/PARENT_PRESENCE sync below.
+    if (!startupNodeInfoSent) {
+        startupNodeInfoSent = true;
+        if (nodeInfoModule) {
+            nodeInfoModule->sendOurNodeInfo();
+            FT_DEBUG("startup nodeinfo sent (%s)", isChild() ? "child" : isBase() ? "base" : "parent");
+        }
+    }
+
+    // Fast position follow-up (ENH): once a fresh GPS fix lands within 2 min of
+    // boot, push an immediate position-bearing update so the family gets the
+    // location quickly instead of waiting a full broadcast interval.
+    if (quickFixPending) {
+        if (bootAtMs == 0) {
+            bootAtMs = millis();
+        } else if (millis() - bootAtMs > 120000UL) {
+            quickFixPending = false; // window elapsed with no fix; normal cadence continues
+        } else {
+            meshtastic_PositionLite p;
+            bool hp = false, st = false;
+            uint8_t am = 0;
+            fillBestPosition(&p, &hp, &st, &am);
+            if (hp && !st) {
+                quickFixPending = false;
+                if (isChild())
+                    sendMessage(FAMILYTRACKER_MSG_CHECKIN, 0, true, false, 0);
+                else
+                    sendMessage(FAMILYTRACKER_MSG_PARENT_PRESENCE, 0, true, false, 0);
+                FT_DEBUG("gps quickfix sent (%u s after boot)", (unsigned)((millis() - bootAtMs) / 1000));
+                LOG_INFO("FamilyTracker: GPS quickfix after %u s", (unsigned)((millis() - bootAtMs) / 1000));
+            }
+        }
+    }
+
+    // ENH-008: persistent indication on this child while PANIC or LOST mode is
+    // active - SOS pattern on the board LED (both platforms) and a repeating
+    // banner on screens. Stays until the mode stands down.
+    bool childAlarming = isChild() && (panicState == FamilyPanicState::PANIC_ACTIVE || lostModeActive);
+    if (childAlarming) {
+#if defined(PIN_LED1)
+        static const uint16_t sosSeq[][2] = {// {ledOn, duration ms} - . . . - - - . . .  (x2 timing for visibility)
+                                             {1, 200}, {0, 200}, {1, 200}, {0, 200}, {1, 200}, {0, 200},
+                                             {1, 600}, {0, 200}, {1, 600}, {0, 200}, {1, 600}, {0, 200},
+                                             {1, 200}, {0, 200}, {1, 200}, {0, 200}, {1, 200}, {0, 1400}};
+        const uint16_t sosTotalMs = 6200;
+        pinMode(PIN_LED1, OUTPUT);
+        uint32_t phase = millis() % sosTotalMs;
+        uint16_t elapsed = 0;
+        for (auto &seg : sosSeq) {
+            elapsed += seg[1];
+            if (phase < elapsed) {
+                digitalWrite(PIN_LED1, seg[0] ? LED_STATE_ON : !LED_STATE_ON);
+                break;
+            }
+        }
+        panicLedActive = true;
+#endif
+#if HAS_SCREEN
+        if (screen && millis() - lastPanicIndicateMs >= 8000UL) {
+            lastPanicIndicateMs = millis();
+            screen->showSimpleBanner(lostModeActive ? "LOST MODE" : "PANIC ACTIVE", 8000);
+        }
+#endif
+        return 100; // fast tick while indicating
+    }
+#if defined(PIN_LED1)
+    if (panicLedActive) { // panic just stood down: release the LED
+        panicLedActive = false;
+        pinMode(PIN_LED1, OUTPUT);
+        digitalWrite(PIN_LED1, !LED_STATE_ON);
+    }
+#endif
+
+    // Auto-favourite family nodes (Friend-Finder/ENH): set_favorite() writes the
+    // node DB to flash, deferred here out of the RX path. Idempotent - a node
+    // already favourited is a no-op.
+    {
+        concurrency::LockGuard guard(&favouriteLock);
+        for (NodeNum num : pendingFavourites)
+            nodeDB->set_favorite(true, num);
+        pendingFavourites.clear();
     }
 
     // Find sound: re-beep the loud tone while active (any role). Fast tick so
@@ -1010,9 +1669,30 @@ int32_t FamilyTrackerModule::runOnce()
         // so a rebooted child is re-established without waiting a full interval.
         uint32_t nowMs = millis();
         if (startupCheckinPending || nowMs - lastCheckinMs >= intervalMs) {
+            bool startup = startupCheckinPending;
             startupCheckinPending = false;
             lastCheckinMs = nowMs;
             sendMessage(FAMILYTRACKER_MSG_CHECKIN, 0, true, false, 0);
+            meshtastic_PositionLite p;
+            bool hp = false, st = false;
+            uint8_t am = 0;
+            fillBestPosition(&p, &hp, &st, &am);
+            if (startup)
+                FT_DEBUG("checkin tx STARTUP gps=%s", hp ? (st ? "stale" : "fresh") : "none");
+            else
+                LOG_INFO("FamilyTracker: checkin tx periodic gps=%s", hp ? (st ? "stale" : "fresh") : "none");
+        }
+        // Child-side parent watchdog (mirror of the parent missed-check-in): no
+        // parent heard for the same timeout -> local come-back alert. Requires
+        // prior contact so a freshly booted child never false-alarms.
+        if (parentHeardEver && !parentMissingAlerted &&
+            (uint32_t)(millis() - lastParentHeardMs) > missedTimeoutSecs * 1000UL) {
+            parentMissingAlerted = true;
+            playMarioMelody(); // come-back semantics: "head home / find parents"
+            FT_DEBUG("no parent contact for %u min - local come back", missedTimeoutSecs / 60);
+            LOG_WARN("FamilyTracker: no parent contact for %u min - local come back", missedTimeoutSecs / 60);
+            if (screen)
+                screen->showSimpleBanner("No parent contact!\nHead home", 10000);
         }
         // Child tracker default view (BUG-010/ENH-010): nearest-parent banner.
         if (screen && nowMs - lastNearestParentMs >= 30000UL) {
@@ -1030,7 +1710,23 @@ int32_t FamilyTrackerModule::runOnce()
     if (startupPresencePending) {
         startupPresencePending = false;
         sendMessage(FAMILYTRACKER_MSG_PARENT_PRESENCE, 0, true, false, 0);
+        FT_DEBUG("parent presence tx (startup)");
     }
+
+    // Periodic parent beacon: a GPS-less parent indoors otherwise transmits
+    // NOTHING for hours, which would trip the child's "no parent contact"
+    // watchdog. A tiny presence datagram every 5 min keeps children informed
+    // (contact proof + nearest-parent refresh).
+    if (millis() - lastPresenceMs >= FAMILYTRACKER_PARENT_PRESENCE_INTERVAL_MS) {
+        lastPresenceMs = millis();
+        sendMessage(FAMILYTRACKER_MSG_PARENT_PRESENCE, 0, true, false, 0);
+    }
+
+    // Base/relay nodes don't run the parent watchdog: a silent sentinel that
+    // only alerts on explicit PANIC/LOST CHILD, and must not duplicate the
+    // parents' MISSED CHECK-IN broadcasts.
+    if (isBase())
+        return 5000;
 
     uint32_t timeoutSecs = missedTimeoutSecs;
     uint8_t lowBatPct = lowBatteryPct;
@@ -1059,8 +1755,29 @@ int32_t FamilyTrackerModule::runOnce()
         if (missed && !wasMissed) {
             playMissedCheckinTone(); // dedicated tone (BUG-002) - not the generic boop
             LOG_WARN("FamilyTracker: CHILD 0x%08x MISSED CHECK-IN (%u s ago)", n->num, age);
+            // One-reporter policy: if another parent already broadcast this
+            // child's missed check-in, stay out of the group chat - the local
+            // tone is our alert. Otherwise we report AND tell the other parents
+            // to suppress their own texts (MISSED_ALERT datagram).
+            bool suppressed = ((int32_t)(missedSuppressedUntilMs[n->num] - millis()) > 0);
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
-            sendTextAlert("MISSED CHECK-IN: %s missed check-in (%u s ago) - no contact", cn ? cn : "Child", age / 1000);
+            if (!suppressed) {
+                sendTextAlert("MISSED CHECK-IN: %s missed check-in (%u s ago) - no contact", cn ? cn : "Child", age / 1000);
+                meshtastic_MeshPacket *p = allocDataPacket();
+                if (p) {
+                    uint8_t payload[16] = {0};
+                    payload[0] = FAMILYTRACKER_PROTOCOL_VERSION;
+                    payload[1] = FAMILYTRACKER_MSG_MISSED_ALERT;
+                    payload[12] = n->num & 0xFF;
+                    payload[13] = (n->num >> 8) & 0xFF;
+                    payload[14] = (n->num >> 16) & 0xFF;
+                    payload[15] = (n->num >> 24) & 0xFF;
+                    p->decoded.payload.size = 16;
+                    memcpy(p->decoded.payload.bytes, payload, 16);
+                    service->sendToMesh(p, RX_SRC_LOCAL, true);
+                }
+                missedSuppressedUntilMs[n->num] = millis() + FAMILYTRACKER_MISSED_SUPPRESS_MS;
+            }
             alertedMissed.push_back(n->num);
         } else if (!missed && wasMissed) {
             // Recovery (SPEC §21) - clears quickly after the startup sync check-in
@@ -1068,6 +1785,7 @@ int32_t FamilyTrackerModule::runOnce()
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
             sendTextAlert("CHECK-IN RESUMED: %s check-in resumed - contact restored", cn ? cn : "Child");
             alertedMissed.erase(std::remove(alertedMissed.begin(), alertedMissed.end(), n->num), alertedMissed.end());
+            missedSuppressedUntilMs.erase(n->num);
         }
 
         // Low battery from stored telemetry (SPEC §23/§24)
@@ -1091,17 +1809,14 @@ int32_t FamilyTrackerModule::runOnce()
     return 5000;
 }
 
-// Child tracker default view (BUG-010/ENH-010): persistent banner showing the
-// nearest known parent's distance + bearing + how old that parent position is.
-void FamilyTrackerModule::updateNearestParentDisplay()
+bool FamilyTrackerModule::getNearestParent(const char **name, float *distM, int *bearingDeg)
 {
-#if HAS_SCREEN
-    if (!screen)
-        return;
     const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
     if (!self || !nodeDB->hasValidPosition(self)) {
-        screen->showSimpleBanner("Nearest parent: Unknown (no GPS)", 31000);
-        return;
+        *name = nullptr;
+        *distM = 0;
+        *bearingDeg = 0;
+        return false;
     }
 
     float selfLat = localPosition.latitude_i * 1e-7f;
@@ -1109,7 +1824,6 @@ void FamilyTrackerModule::updateNearestParentDisplay()
     float bestDistM = INFINITY;
     int bestBearing = -1;
     const char *bestName = nullptr;
-    const meshtastic_NodeInfoLite *bestNode = nullptr;
     size_t count = nodeDB->getNumMeshNodes();
     for (size_t i = 0; i < count; i++) {
         const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
@@ -1131,27 +1845,52 @@ void FamilyTrackerModule::updateNearestParentDisplay()
             if (bestBearing < 0)
                 bestBearing += 360;
             bestName = (n->long_name[0]) ? n->long_name : n->short_name;
-            bestNode = n;
         }
     }
     if (!bestName) {
-        screen->showSimpleBanner("Nearest parent: Unknown", 31000);
-        return;
+        *name = nullptr;
+        *distM = 0;
+        *bearingDeg = 0;
+        return false;
     }
+    *name = bestName;
+    *distM = bestDistM;
+    *bearingDeg = bestBearing;
+    return true;
+}
 
-    char distStr[24];
-    if (bestDistM < 1000.0f)
-        snprintf(distStr, sizeof(distStr), "%.0f m", bestDistM);
-    else
-        snprintf(distStr, sizeof(distStr), "%.1f km", bestDistM / 1000.0f);
-    uint32_t ago = sinceLastSeen(bestNode);
-    char b[64];
-    if (ago != UINT32_MAX)
-        snprintf(b, sizeof(b), "Nearest parent: %s %s %d deg (%lus ago)", bestName, distStr, bestBearing,
-                 (unsigned long)ago);
-    else
-        snprintf(b, sizeof(b), "Nearest parent: %s %s %d deg", bestName, distStr, bestBearing);
-    screen->showSimpleBanner(b, 31000);
-    LOG_INFO("FamilyTracker: nearest-parent display = %s", b);
+void FamilyTrackerModule::autoFavourite(NodeNum num)
+{
+    if (!num || num == nodeDB->getNodeNum() || nodeDB->isFavorite(num))
+        return;
+    concurrency::LockGuard guard(&favouriteLock);
+    if (std::find(favouriteQueued.begin(), favouriteQueued.end(), num) == favouriteQueued.end()) {
+        favouriteQueued.push_back(num);
+        pendingFavourites.push_back(num);
+    }
+}
+
+// Child tracker warm-up hook (BUG-010/ENH-010): the nearest-parent ARROW now
+// lives in a dedicated "Parent" screen frame (Screen::setFrames) instead of a
+// text banner over the Position screen. Kept for the PARENT_PRESENCE path to
+// seed logging; the frame itself computes live via getNearestParent().
+void FamilyTrackerModule::updateNearestParentDisplay()
+{
+#if HAS_SCREEN
+    if (!screen)
+        return;
+    const char *name = nullptr;
+    float distM = 0;
+    int bearing = 0;
+    if (getNearestParent(&name, &distM, &bearing)) {
+        char distStr[24];
+        if (distM < 1000.0f)
+            snprintf(distStr, sizeof(distStr), "%.0f m", distM);
+        else
+            snprintf(distStr, sizeof(distStr), "%.1f km", distM / 1000.0f);
+        LOG_INFO("FamilyTracker: nearest parent = %s %s %d deg", name, distStr, bearing);
+    } else {
+        LOG_INFO("FamilyTracker: nearest parent unknown (no GPS or no parent with position)");
+    }
 #endif
 }

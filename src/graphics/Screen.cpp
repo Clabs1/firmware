@@ -74,6 +74,7 @@ extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
 #include "graphics/TFTPalette.h"
 #include "graphics/emotes.h"
 #include "graphics/images.h"
+#include "graphics/draw/CompassRenderer.h" // BUG-010/ENH: child "Parent" arrow frame
 #include "input/TouchScreenImpl1.h"
 #include "main.h"
 #include "mesh-pb-constants.h"
@@ -1369,6 +1370,72 @@ void Screen::setScreensaverFrames(FrameCallback einkScreensaver)
 #define CLEAR_FRAME_TITLES()
 #endif
 
+// Child tracker "Parent" frame (BUG-010/ENH): a big arrow to the nearest known
+// parent (Friend-Finder style) plus its distance/bearing. A child who can't read
+// follows the arrow; the Position screen stays a separate menu item.
+static void drawFamilyNearestParentFrame(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
+{
+    (void)state;
+    (void)x;
+    (void)y;
+    display->clear();
+    graphics::drawCommonHeader(display, x, y, "Parent");
+    const int *textPos = graphics::getTextPositions(display);
+    display->setFont(FONT_SMALL);
+    int line = 1;
+
+    const char *name = nullptr;
+    float distM = 0;
+    int bearingDeg = 0;
+    const bool found = familyTrackerModule && familyTrackerModule->getNearestParent(&name, &distM, &bearingDeg);
+
+    const meshtastic_NodeInfoLite *ourNode = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    const bool hasOwnFix = ourNode && nodeDB->hasValidPosition(ourNode);
+
+    if (!found || !hasOwnFix) {
+        display->setTextAlignment(TEXT_ALIGN_CENTER);
+        display->drawString(display->getWidth() / 2, textPos[line++], "No GPS fix");
+        display->drawString(display->getWidth() / 2, textPos[line++], "or parent unknown");
+        return;
+    }
+
+    meshtastic_PositionLite ownPos;
+    double selfLat = 0, selfLon = 0;
+    if (nodeDB->copyNodePosition(ourNode->num, ownPos)) {
+        selfLat = DegD(ownPos.latitude_i);
+        selfLon = DegD(ownPos.longitude_i);
+    }
+
+    // Name row on top, compass/arrow centered in the body, distance at the bottom
+    // so nothing overlaps on a 128x64 display.
+    display->setTextAlignment(TEXT_ALIGN_CENTER);
+    display->drawString(display->getWidth() / 2, textPos[line++], name);
+
+    const uint16_t compassDiam = graphics::CompassRenderer::getCompassDiam(display->getWidth(), display->getHeight());
+    const int16_t compassRadius = compassDiam / 2;
+    const int16_t compassX = display->getWidth() / 2;
+    const int16_t compassY = (int16_t)((display->getHeight() + textPos[line]) / 2);
+
+    // Heading-aware arrow when a sensor/estimated heading exists, otherwise an
+    // absolute (north-up) arrow so a direction is always shown.
+    float heading = 0.0f;
+    const bool haveHeading = graphics::CompassRenderer::getHeadingRadians(selfLat, selfLon, heading);
+    const float bearingRad = bearingDeg * DEG_TO_RAD;
+    const float adjusted =
+        haveHeading ? graphics::CompassRenderer::adjustBearingForCompassMode(bearingRad, heading) : bearingRad;
+
+    display->drawCircle(compassX, compassY, compassRadius);
+    graphics::CompassRenderer::drawCompassNorth(display, compassX, compassY, heading, compassRadius);
+    graphics::CompassRenderer::drawNodeHeading(display, compassX, compassY, compassDiam, adjusted);
+
+    char distStr[24];
+    if (distM < 1000.0f)
+        snprintf(distStr, sizeof(distStr), "%.0f m", distM);
+    else
+        snprintf(distStr, sizeof(distStr), "%.1f km", distM / 1000.0f);
+    display->drawString(display->getWidth() / 2, display->getHeight() - FONT_HEIGHT_SMALL - 2, distStr);
+}
+
 void Screen::setFrames(FrameFocus focus)
 {
     // Block setFrames calls when virtual keyboard is active to prevent overlay interference
@@ -1389,6 +1456,10 @@ void Screen::setFrames(FrameFocus focus)
     CLEAR_FRAME_TITLES();
 
     size_t numframes = 0;
+
+    // Child tracker nearest-parent arrow frame index (BUG-010/ENH): registered
+    // inside HAS_GPS below; 255 = not present on this device/role.
+    uint8_t familyParentIdx = 255;
 
     // If we have a critical fault, show it first
     fsi.positions.fault = numframes;
@@ -1487,6 +1558,14 @@ void Screen::setFrames(FrameFocus focus)
         normalFrames[numframes++] = graphics::UIRenderer::drawCompassAndLocationScreen;
         indicatorIcons.push_back(icon_compass);
         PUSH_FRAME_TITLE("GPS");
+    }
+    // Child tracker "Parent" arrow frame: a separate menu item, NOT an overlay on
+    // the Position screen (BUG-010/ENH). Child boots into it (FOCUS_DEFAULT).
+    if (familyTrackerModule && familyTrackerModule->isChild()) {
+        familyParentIdx = numframes;
+        normalFrames[numframes++] = drawFamilyNearestParentFrame;
+        indicatorIcons.push_back(icon_node);
+        PUSH_FRAME_TITLE("Parent");
     }
 #endif
     if (RadioLibInterface::instance && !hiddenFrames.lora) {
@@ -1609,9 +1688,15 @@ void Screen::setFrames(FrameFocus focus)
     switch (focus) {
     case FOCUS_DEFAULT:
         // BUG-010/ENH-010: a screen-equipped child tracker boots into the
-        // Position/GPS navigation frame (nearest-parent banner overlays it).
-        if (familyTrackerModule && familyTrackerModule->isChild() && fsi.positions.gps != 255) {
-            ui->switchToFrame(fsi.positions.gps);
+        // nearest-parent "Parent" arrow frame (arrow, not the old text banner);
+        // falls back to Position/GPS if the arrow frame is unavailable.
+        if (familyTrackerModule && familyTrackerModule->isChild()) {
+            if (familyParentIdx != 255)
+                ui->switchToFrame(familyParentIdx);
+            else if (fsi.positions.gps != 255)
+                ui->switchToFrame(fsi.positions.gps);
+            else
+                ui->switchToFrame(fsi.positions.deviceFocused);
         } else {
             ui->switchToFrame(fsi.positions.deviceFocused);
         }
@@ -2273,7 +2358,10 @@ int Screen::handleInputEvent(const InputEvent *event)
             if (event->inputEvent == INPUT_BROKER_LEFT || event->inputEvent == INPUT_BROKER_ALT_PRESS) {
                 showFrame(FrameDirection::PREVIOUS);
             } else if (event->inputEvent == INPUT_BROKER_RIGHT || event->inputEvent == INPUT_BROKER_USER_PRESS) {
-                showFrame(FrameDirection::NEXT);
+                // Family child: the short press IS the panic button - keep the
+                // default (nearest parent) frame instead of cycling away.
+                if (!(familyTrackerModule && familyTrackerModule->isChild()))
+                    showFrame(FrameDirection::NEXT);
             } else if (event->inputEvent == INPUT_BROKER_FN_F1) {
                 this->ui->switchToFrame(0);
 #ifdef USERPREFS_UI_TEST_LOG

@@ -25,6 +25,7 @@
 #include "memory/MemAudit.h"
 #include "mesh-pb-constants.h"
 #include "mesh/generated/meshtastic/deviceonly_legacy.pb.h"
+#include "mesh/generated/meshtastic/cannedmessages.pb.h"
 #include "meshUtils.h"
 #include "modules/NeighborInfoModule.h"
 #include "target_specific.h"
@@ -795,6 +796,33 @@ void NodeDB::resetRadioConfig(bool is_fresh_install)
 #endif
 
     channels.onConfigChanged();
+
+#ifdef USERPREFS_FAMILY_CANNED_MESSAGES
+    {
+        // Bake the T1 canned-message menu to family commands (stock default is
+        // "Hi|Bye|Yes|No|Ok"). Role-aware: parents/base get the command set,
+        // trackers get status phrases. Write /prefs/cannedConf.proto only when
+        // the stored list differs so every boot is cheap; app edits revert to
+        // these defaults on reboot (like the forced family channel above).
+        static const char *const cannedParent = "come back|found|lost";
+        static const char *const cannedChild = "Help me|I'm OK|On my way|Come get me";
+        const char *canned =
+            (config.device.role == meshtastic_Config_DeviceConfig_Role_TRACKER) ? cannedChild : cannedParent;
+        meshtastic_CannedMessageModuleConfig cm = meshtastic_CannedMessageModuleConfig_init_default;
+        if (loadProto("/prefs/cannedConf.proto", meshtastic_CannedMessageModuleConfig_size,
+                      sizeof(meshtastic_CannedMessageModuleConfig), &meshtastic_CannedMessageModuleConfig_msg,
+                      &cm) != LoadFileResult::LOAD_SUCCESS) {
+            memset(&cm, 0, sizeof(cm));
+        }
+        if (strncmp(cm.messages, canned, sizeof(cm.messages)) != 0) {
+            strncpy(cm.messages, canned, sizeof(cm.messages) - 1);
+            cm.messages[sizeof(cm.messages) - 1] = '\0';
+            saveProto("/prefs/cannedConf.proto", meshtastic_CannedMessageModuleConfig_size,
+                      &meshtastic_CannedMessageModuleConfig_msg, &cm);
+            LOG_WARN("FamilyTracker: baked canned messages (%s)", canned);
+        }
+    }
+#endif
 
     // Update the global myRegion
     initRegion();

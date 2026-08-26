@@ -25,3 +25,4 @@ void playMarioMelody();   // child: come-back - super-mario-style tune
 void playFoundMelody();   // all: "found / level complete" success fanfare
 void playMissedCheckinTone(); // parent: child missed a check-in - distinct double-warning
 void playLowBatteryTone();    // parent: child battery low - distinct double-beep
+void playErrorTone();         // any: command not recognised (e.g. unknown child name)

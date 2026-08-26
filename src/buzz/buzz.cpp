@@ -295,8 +295,14 @@ void playPanicCall()
 
 void playPanicAlert()
 {
-    // Urgent two-tone alert for the parent receiving a panic (distinct from the child's call).
-    ToneDuration melody[] = {{NOTE_C5, 140}, {NOTE_SILENT, 60}, {NOTE_C5, 140}, {NOTE_SILENT, 60}, {NOTE_C5, 140}};
+    // Parent panic alarm: SOS in morse (... --- ...) on a high note - distinct
+    // from the child's three-note call and from the low lost-child alert
+    // (BUG-015 follow-up: field feedback asked for SOS specifically).
+    ToneDuration melody[] = {
+        {NOTE_C6, 150}, {NOTE_SILENT, 100}, {NOTE_C6, 150}, {NOTE_SILENT, 100}, {NOTE_C6, 150}, {NOTE_SILENT, 200},
+        {NOTE_C6, 450}, {NOTE_SILENT, 100}, {NOTE_C6, 450}, {NOTE_SILENT, 100}, {NOTE_C6, 450}, {NOTE_SILENT, 200},
+        {NOTE_C6, 150}, {NOTE_SILENT, 100}, {NOTE_C6, 150}, {NOTE_SILENT, 100}, {NOTE_C6, 150},
+    };
     playTones(melody, sizeof(melody) / sizeof(ToneDuration));
 }
 
@@ -361,6 +367,16 @@ void playLowBatteryTone()
     // Distinct double-beep (lower, non-urgent) for a low-battery child (SPEC §23).
     ToneDuration melody[] = {
         {NOTE_C4, 100}, {NOTE_SILENT, 80}, {NOTE_C4, 100},
+    };
+    playTones(melody, sizeof(melody) / sizeof(ToneDuration));
+}
+
+void playErrorTone()
+{
+    // Two falling notes - "command not recognised" (e.g. unknown child name).
+    // Local only; never broadcast. Distinct from every family alert tone.
+    ToneDuration melody[] = {
+        {NOTE_E5, 150}, {NOTE_SILENT, 70}, {NOTE_A4, 280},
     };
     playTones(melody, sizeof(melody) / sizeof(ToneDuration));
 }
