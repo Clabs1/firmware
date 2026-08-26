@@ -1293,6 +1293,14 @@ void NodeDB::initConfigIntervals()
     config.position.gps_update_interval = default_gps_update_interval;
 #endif
 
+#ifdef USERPREFS_FAMILY_ROLE_TUNING
+    // A CLIENT_BASE sits at camp / in the car for hours: a 15 min GPS refresh
+    // is plenty and saves battery. (FamilyTrackerModule re-raises this to the
+    // baked default if the node is picked up and promoted to CLIENT.)
+    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE)
+        config.position.gps_update_interval = 15 * 60;
+#endif
+
 #ifdef USERPREFS_CONFIG_POSITION_BROADCAST_INTERVAL
     config.position.position_broadcast_secs = USERPREFS_CONFIG_POSITION_BROADCAST_INTERVAL;
 #else

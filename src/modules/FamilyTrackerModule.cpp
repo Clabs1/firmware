@@ -1564,6 +1564,11 @@ void FamilyTrackerModule::updateBaseMobility()
     // Picked up: become a full parent.
     mobilePromoted = true;
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+#ifdef USERPREFS_CONFIG_GPS_UPDATE_INTERVAL
+    // Undo the CLIENT_BASE 15-min GPS economy - a moving searcher wants fresh
+    // fixes (NodeDB::initConfigIntervals bakes this down to 900 s for base).
+    config.position.gps_update_interval = USERPREFS_CONFIG_GPS_UPDATE_INTERVAL;
+#endif
     nodeDB->saveToDisk();
     if (nodeInfoModule)
         nodeInfoModule->sendOurNodeInfo(); // children re-role us in their nodedb
