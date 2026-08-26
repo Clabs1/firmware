@@ -456,7 +456,8 @@ void FamilyTrackerModule::sendFound()
     // clears its state and plays the "level complete" success tone. The child that
     // was actually active announces "FOUND" once (see the CANCEL handler).
     sendMessageTo(FAMILYTRACKER_MSG_CANCEL, 0, false, false, 0, NODENUM_BROADCAST);
-    lostDeclaredByUs.clear(); // global stand-down clears our declarations too
+    lostDeclaredByUs.clear();   // global stand-down clears our declarations too
+    parentAlertNodes.clear();   // and the persistent panic indication (ENH-001)
     LOG_WARN("FamilyTracker: FOUND stand-down broadcast by parent");
 }
 
@@ -465,6 +466,7 @@ bool FamilyTrackerModule::sendFoundTo(NodeNum target)
     // Targeted stand-down ("found bob"): only that child clears; siblings are
     // untouched. The child announces its own FOUND text (attribution-neutral).
     sendMessageTo(FAMILYTRACKER_MSG_CANCEL, 0, false, false, 0, target);
+    parentAlertNodes.erase(target); // targeted stand-down ends this child's alert (ENH-001)
     LOG_WARN("FamilyTracker: FOUND targeted at 0x%08x", (unsigned)target);
     return true;
 }
@@ -1128,6 +1130,16 @@ static bool isFamilyCommandText(const meshtastic_MeshPacket &mp)
 
 ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
+    // BUG-001: ANY packet authored by a tracked child is proof of contact -
+    // periodic positions, telemetry, texts, family datagrams alike. The
+    // missed-check-in watchdog may only fire after 10 min with NO traffic
+    // whatsoever, so contact tracking can't depend on our own CHECKIN alone.
+    if (isParent() && mp.from != nodeDB->getNodeNum()) {
+        const meshtastic_NodeInfoLite *snd = nodeDB->getMeshNode(mp.from);
+        if (snd && snd->role == meshtastic_Config_DeviceConfig_Role_TRACKER)
+            markChildSeen(mp.from, millis());
+    }
+
     // Parent-contact tracking (child watchdog mirror): any text authored by a
     // non-tracker proves a parent is reachable.
     if (mp.from != nodeDB->getNodeNum()) {
@@ -1137,8 +1149,14 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             markParentHeard();
     }
 
-    // Human-readable family commands ("Child 1 is lost") arrive as text.
+    // Human-readable family commands ("Child 1 is lost") arrive as text ON THE
+    // CHANNEL. Direct messages (to == us) must flow untouched on every role
+    // (REQ-001): never command-parsed, never tone-suppressed - a child's phone
+    // chatting with a parent is plain Meshtastic messaging.
     if (mp.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+        if (!isBroadcast(mp.to))
+            return ProcessMessage::CONTINUE;
+
         // Consume OUR OWN alert texts first (BUG-004/009): the child's
         // "Alice is lost - please help find me" contains " is lost", so it must
         // never re-enter command matching (that would loop LOST_CHILD -> text ->
@@ -1237,6 +1255,8 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                         pendingPanicCount++;
                     else
                         LOG_WARN("FamilyTracker: panic queue overflow (oldest dropped)");
+                    // ENH-001: persistent parent awareness until stood down.
+                    parentAlertNodes.insert(mp.from);
                     lastPanicChild = mp.from; // target for a quick unnamed "on my way"
                     lastPanicChildMs = nowMs;
                 }
@@ -1460,6 +1480,15 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             const char *pn = (sender && sender->long_name[0])
                                  ? sender->long_name
                                  : (sender && sender->short_name[0]) ? sender->short_name : "Parent";
+            // ENH-001 bookkeeping: a broadcast stand-down clears every parent-
+            // side panic indication; a targeted one clears just that child.
+            {
+                concurrency::LockGuard guard(&stateLock);
+                if (isBroadcast(mp.to))
+                    parentAlertNodes.clear();
+                else
+                    parentAlertNodes.erase(mp.to);
+            }
             // Only the node with an ACTUALLY active alert announces "found"
             // (so a broadcast stand-down doesn't make every node claim it was
             // found). Explicit state machine - NOT lastPanicEventId, which a
@@ -1658,8 +1687,51 @@ int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
 
 // Parent watchdog: missed check-in + low battery (SPEC §18-§23).
 // Child: periodic CHECKIN heartbeat independent of GPS (SPEC §13/§14/§18).
+// Shared SOS-LED driver (ENH-008 child / ENH-001 parent). Phase comes from
+// millis() alone, so the pattern keeps running whatever the display does.
+// Pass on=false on every tick once alarming ends - the transition releases
+// the LED exactly once.
+void FamilyTrackerModule::indicateSosLed(bool on)
+{
+#if defined(PIN_LED1)
+    static const uint16_t sosSeq[][2] = {// {ledOn, duration ms} - . . . - - - . . .  (x2 timing for visibility)
+                                         {1, 200}, {0, 200}, {1, 200}, {0, 200}, {1, 200}, {0, 200},
+                                         {1, 600}, {0, 200}, {1, 600}, {0, 200}, {1, 600}, {0, 200},
+                                         {1, 200}, {0, 200}, {1, 200}, {0, 200}, {1, 200}, {0, 1400}};
+    const uint16_t sosTotalMs = 6200;
+    pinMode(PIN_LED1, OUTPUT);
+    if (!on) {
+        if (ledSosActive) {
+            ledSosActive = false;
+            digitalWrite(PIN_LED1, !LED_STATE_ON);
+        }
+        return;
+    }
+    ledSosActive = true;
+    uint32_t phase = millis() % sosTotalMs;
+    uint16_t elapsed = 0;
+    for (auto &seg : sosSeq) {
+        elapsed += seg[1];
+        if (phase < elapsed) {
+            digitalWrite(PIN_LED1, seg[0] ? LED_STATE_ON : !LED_STATE_ON);
+            break;
+        }
+    }
+#endif
+}
+
 int32_t FamilyTrackerModule::runOnce()
 {
+#ifdef FAMILY_GPS_DIAG
+    // ENH-002 temporary T1 hardware diagnostic: hold the GPS receiver fully
+    // powered (no duty-cycling between fixes) while the GPS power-management
+    // issue is investigated. Broadcast cadence is UNCHANGED, so this affects
+    // only power/sampling - never mesh traffic. Kept separate from
+    // FAMILY_DEBUG_CHAT because it may stay enabled for weeks.
+    if (gps)
+        gps->setPowerState(GPSPowerState::GPS_ACTIVE);
+#endif
+
     // Act on a queued panic OUTSIDE the radio RX path: banner + buzzer + ACK.
     // None of these side-effects run inside handleReceived(), which is what
     // hangs the T1 parent.
@@ -1742,44 +1814,9 @@ int32_t FamilyTrackerModule::runOnce()
         }
     }
 
-    // ENH-008: persistent indication on this child while PANIC or LOST mode is
-    // active - SOS pattern on the board LED (both platforms) and a repeating
-    // banner on screens. Stays until the mode stands down.
-    bool childAlarming = isChild() && (panicState == FamilyPanicState::PANIC_ACTIVE || lostModeActive);
-    if (childAlarming) {
-#if defined(PIN_LED1)
-        static const uint16_t sosSeq[][2] = {// {ledOn, duration ms} - . . . - - - . . .  (x2 timing for visibility)
-                                             {1, 200}, {0, 200}, {1, 200}, {0, 200}, {1, 200}, {0, 200},
-                                             {1, 600}, {0, 200}, {1, 600}, {0, 200}, {1, 600}, {0, 200},
-                                             {1, 200}, {0, 200}, {1, 200}, {0, 200}, {1, 200}, {0, 1400}};
-        const uint16_t sosTotalMs = 6200;
-        pinMode(PIN_LED1, OUTPUT);
-        uint32_t phase = millis() % sosTotalMs;
-        uint16_t elapsed = 0;
-        for (auto &seg : sosSeq) {
-            elapsed += seg[1];
-            if (phase < elapsed) {
-                digitalWrite(PIN_LED1, seg[0] ? LED_STATE_ON : !LED_STATE_ON);
-                break;
-            }
-        }
-        panicLedActive = true;
-#endif
-#if HAS_SCREEN
-        if (screen && millis() - lastPanicIndicateMs >= 8000UL) {
-            lastPanicIndicateMs = millis();
-            screen->showSimpleBanner(lostModeActive ? "LOST MODE" : "PANIC ACTIVE", 8000);
-        }
-#endif
-        return 100; // fast tick while indicating
-    }
-#if defined(PIN_LED1)
-    if (panicLedActive) { // panic just stood down: release the LED
-        panicLedActive = false;
-        pinMode(PIN_LED1, OUTPUT);
-        digitalWrite(PIN_LED1, !LED_STATE_ON);
-    }
-#endif
+    // (Child/parent persistent alarm indication moved into the role branches
+    // below - it must never preempt the periodic check-in, which is exactly
+    // how BUG-001's false "missed/resumed" pair was born.)
 
     // Auto-favourite family nodes (Friend-Finder/ENH): set_favorite() writes the
     // node DB to flash, deferred here out of the RX path. Idempotent - a node
@@ -1789,6 +1826,36 @@ int32_t FamilyTrackerModule::runOnce()
         for (NodeNum num : pendingFavourites)
             nodeDB->set_favorite(true, num);
         pendingFavourites.clear();
+    }
+
+    // ENH-001: PARENT persistent panic indication - a child panicked and nobody
+    // has stood it down yet. SOS LED (wall-clock phase: keeps flashing while
+    // the screen sleeps) + repeating "PANIC: <name>" banner on displays.
+#if defined(PIN_LED1)
+    indicateSosLed(true); // releases itself when the set is empty
+#endif
+    bool parentAlarming;
+    {
+        concurrency::LockGuard guard(&stateLock);
+        parentAlarming = !parentAlertNodes.empty();
+    }
+    if (parentAlarming) {
+#if HAS_SCREEN
+        NodeNum firstAlert = 0;
+        {
+            concurrency::LockGuard guard(&stateLock);
+            firstAlert = *parentAlertNodes.begin();
+        }
+        if (screen && millis() - lastAlarmBannerMs >= 8000UL) {
+            lastAlarmBannerMs = millis();
+            const meshtastic_NodeInfoLite *c = nodeDB->getMeshNode(firstAlert);
+            const char *cn = (c && c->long_name[0]) ? c->long_name : (c && c->short_name[0]) ? c->short_name : "child";
+            char banner[64];
+            snprintf(banner, sizeof(banner), "PANIC: %s", cn);
+            screen->showSimpleBanner(banner, 8000);
+        }
+#endif
+        return 100; // fast tick while indicating
     }
 
     // Find sound: re-beep the loud tone while active (any role). Fast tick so
@@ -1844,6 +1911,23 @@ int32_t FamilyTrackerModule::runOnce()
         if (screen && nowMs - lastNearestParentMs >= 30000UL) {
             lastNearestParentMs = nowMs;
             updateNearestParentDisplay();
+        }
+
+        // ENH-008: persistent own-alarm indication. Deliberately LAST in the
+        // child tick: the SOS LED loop must never preempt the periodic CHECKIN
+        // again - starving it was BUG-001's false missed-check-in source.
+        bool alarming = panicState == FamilyPanicState::PANIC_ACTIVE || lostModeActive;
+#if defined(PIN_LED1)
+        indicateSosLed(alarming); // self-releases when alarming goes false
+#endif
+        if (alarming) {
+#if HAS_SCREEN
+            if (screen && millis() - lastAlarmBannerMs >= 8000UL) {
+                lastAlarmBannerMs = millis();
+                screen->showSimpleBanner(lostModeActive ? "LOST MODE" : "PANIC ACTIVE", 8000);
+            }
+#endif
+            return 100; // fast tick while indicating
         }
         return 5000;
     }

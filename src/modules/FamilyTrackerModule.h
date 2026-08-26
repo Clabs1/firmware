@@ -115,8 +115,14 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
 
     bool wantPacket(const meshtastic_MeshPacket *p) override
     {
+        // PRIVATE_APP: family protocol. TEXT_MESSAGE_APP: channel commands +
+        // alert consumption (DMs pass straight through, REQ-001). POSITION/
+        // TELEMETRY: contact proof for the child watchdog - any sign of life
+        // from a tracked child must reset the missed-check-in timer (BUG-001).
         return p->decoded.portnum == meshtastic_PortNum_PRIVATE_APP ||
-               p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP;
+               p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
+               p->decoded.portnum == meshtastic_PortNum_POSITION_APP ||
+               p->decoded.portnum == meshtastic_PortNum_TELEMETRY_APP;
     }
 
     ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
@@ -390,17 +396,23 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // release builds entirely.
     void ftDebug(const char *format, ...);
 
-    // ENH-008: persistent panic indication - SOS pattern on PIN_LED1 while a
-    // panic is active on this child (+ repeating banner on screen hardware).
-    // Cleared when the panic stands down.
-    uint32_t lastPanicIndicateMs = 0;
-    bool panicLedActive = false;
+    // ENH-008/ENH-001 alarm indication state lives with indicateSosLed() below.
 
     // Child tracker default view (BUG-010/ENH-010): the nearest-parent arrow is
     // now a dedicated "Parent" screen frame (Screen::setFrames). This retained
     // as a PARENT_PRESENCE warm-up + log hook (no more banner overlay).
     void updateNearestParentDisplay();
     uint32_t lastNearestParentMs = 0;
+
+    // ENH-008/ENH-001: persistent alarm indication - SOS pattern on PIN_LED1
+    // (runs on wall-clock phase, so it keeps flashing while the screen sleeps)
+    // plus a repeating banner on displays. Child: own PANIC_ACTIVE / lost mode.
+    // Parent: a child panic seen and not yet cleared (parentAlertNodes).
+    void indicateSosLed(bool on);
+    bool ledSosActive = false;
+    uint32_t lastAlarmBannerMs = 0;    // Children this parent has seen panic and NOT yet stood down. Inserted on
+    // PANIC rx; erased by targeted found, wholesale by global found / CANCEL.
+    std::set<NodeNum> parentAlertNodes;
 
     // Auto-favourite family members (Friend-Finder/ENH): every node that sends a
     // valid family datagram is favourited once. set_favorite() saves the node DB
