@@ -153,6 +153,7 @@ void setupModules()
 #if !MESHTASTIC_EXCLUDE_BEACON
     meshBeaconBroadcastModule = new MeshBeaconBroadcastModule();
     meshBeaconListenerModule = new MeshBeaconListenerModule();
+    meshBeaconTxHook = new MeshBeaconTxHook(); // registers itself with the radio driver's TX hooks
 #endif
 #if !MESHTASTIC_EXCLUDE_GPS
     positionModule = new PositionModule();
@@ -230,7 +231,7 @@ void setupModules()
 #if HAS_TELEMETRY && HAS_SENSOR && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
     if (moduleConfig.has_telemetry &&
         (moduleConfig.telemetry.environment_measurement_enabled || moduleConfig.telemetry.environment_screen_enabled)) {
-        new EnvironmentTelemetryModule();
+        environmentTelemetryModule = new EnvironmentTelemetryModule();
     }
 #if HAS_TELEMETRY && HAS_SENSOR && !MESHTASTIC_EXCLUDE_AIR_QUALITY_SENSOR
     if (moduleConfig.has_telemetry &&

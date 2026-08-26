@@ -606,7 +606,7 @@ class AnalogBatteryLevel : public HasBatteryLevel
             // get current flow from INA sensor - negative value means power flowing
             // into the battery default assuming  BATTERY+  <--> INA_VIN+ <--> SHUNT
             // RESISTOR <--> INA_VIN- <--> LOAD
-            LOG_DEBUG("Using INA on I2C addr 0x%x for charging detection", config.power.device_battery_ina_address);
+            LOG_TRACE("Using INA on I2C addr 0x%x for charging detection", config.power.device_battery_ina_address);
 #if defined(INA_CHARGING_DETECTION_INVERT)
             return getINACurrent() > 0;
 #else
@@ -837,12 +837,13 @@ bool Power::setup()
 
 void Power::powerCommandsCheck()
 {
-    if (rebootAtMsec && millis() > rebootAtMsec) {
+    // 0 means "not scheduled" for both, and reads as long expired - test it first.
+    if (rebootAtMsec && Throttle::deadlinePassed(rebootAtMsec)) {
         LOG_INFO("Rebooting");
         reboot();
     }
 
-    if (shutdownAtMsec && millis() > shutdownAtMsec) {
+    if (shutdownAtMsec && Throttle::deadlinePassed(shutdownAtMsec)) {
         shutdownAtMsec = 0;
         shutdown();
     }
@@ -884,9 +885,10 @@ void Power::reboot()
 #elif defined(ARCH_STM32)
     HAL_NVIC_SystemReset();
 #else
-    rebootAtMsec = -1;
-    LOG_WARN("FIXME implement reboot for this platform; some settings "
-             "need restart to apply");
+    // 0 disarms; UINT32_MAX would read as long expired and reboot-loop.
+    rebootAtMsec = 0;
+    LOG_WARN("FIXME implement reboot for this platform. Note that some settings "
+             "require a restart to be applied");
 #endif
 }
 
@@ -1140,8 +1142,10 @@ int32_t Power::runOnce()
         // cancel action also turns the screen on and off.
         if (PMU->isPekeyShortPressIrq()) {
             LOG_INFO("Input: Corona Button Click");
-            InputEvent event = {.inputEvent = (input_broker_event)INPUT_BROKER_CANCEL, .kbchar = 0, .touchX = 0, .touchY = 0};
-            inputBroker->injectInputEvent(&event);
+            if (inputBroker) {
+                InputEvent event = {.inputEvent = (input_broker_event)INPUT_BROKER_CANCEL, .kbchar = 0, .touchX = 0, .touchY = 0};
+                inputBroker->injectInputEvent(&event);
+            }
         }
 #endif
         /*
@@ -1444,6 +1448,48 @@ bool Power::axpChipInit()
             PMU->disablePowerOutput(XPOWERS_DLDO1); // Invalid power channel, it does not exist
             PMU->disablePowerOutput(XPOWERS_DLDO2); // Invalid power channel, it does not exist
             PMU->disablePowerOutput(XPOWERS_VBACKUP);
+        } else if (HW_VENDOR == meshtastic_HardwareModel_T_WATCH_ULTRA) {
+            PMU->clearIrqStatus();
+
+            // Turn off the PMU charging indicator light, no physical connection
+            PMU->setChargingLedMode(XPOWERS_CHG_LED_OFF); // NO LED
+
+            PMU->setPowerChannelVoltage(XPOWERS_ALDO1, 3300); // SD Card
+            PMU->enablePowerOutput(XPOWERS_ALDO1);
+
+            PMU->setPowerChannelVoltage(XPOWERS_ALDO2, 3300); // Display
+            PMU->enablePowerOutput(XPOWERS_ALDO2);
+
+            PMU->setPowerChannelVoltage(XPOWERS_ALDO3, 3300); // LoRa
+            PMU->enablePowerOutput(XPOWERS_ALDO3);
+
+            PMU->setPowerChannelVoltage(XPOWERS_ALDO4, 1800); // Sensor
+            PMU->enablePowerOutput(XPOWERS_ALDO4);
+
+            PMU->setPowerChannelVoltage(XPOWERS_BLDO1, 3300); // GPS
+            PMU->enablePowerOutput(XPOWERS_BLDO1);
+
+            PMU->setPowerChannelVoltage(XPOWERS_BLDO2, 3300); // Speaker
+            PMU->enablePowerOutput(XPOWERS_BLDO2);
+
+            PMU->setPowerChannelVoltage(XPOWERS_VBACKUP, 3300); // RTC Button battery
+            PMU->enablePowerOutput(XPOWERS_VBACKUP);
+
+            // PMU->enablePowerOutput(XPOWERS_DLDO1); // NFC
+
+            // UNUSED POWER CHANNEL
+            PMU->disablePowerOutput(XPOWERS_DCDC2);
+            PMU->disablePowerOutput(XPOWERS_DCDC3);
+            PMU->disablePowerOutput(XPOWERS_DCDC4);
+            PMU->disablePowerOutput(XPOWERS_DCDC5);
+            PMU->disablePowerOutput(XPOWERS_CPULDO);
+
+            // Enable Measure
+            PMU->enableBattDetection();
+            PMU->enableVbusVoltageMeasure();
+            PMU->enableBattVoltageMeasure();
+            PMU->enableSystemVoltageMeasure();
+            PMU->enableTemperatureMeasure();
         } else if (HW_VENDOR == meshtastic_HardwareModel_TBEAM_BPF) {
             // T-Beam BPF rail map (per schematic LilyGo_TBeam_BPF r2025-05-08):
             //   DCDC1  -> ESP32 + OLED 3V3 (always on, protected)
@@ -1881,10 +1927,10 @@ class LipoCharger : public HasBatteryLevel
         bool isCharging = PPM->isCharging();
         if (bq) {
             if (isCharging) {
-                LOG_DEBUG("BQ27220 time to full charge: %d min", bq->getTimeToFull());
+                LOG_TRACE("BQ27220 time to full charge: %d min", bq->getTimeToFull());
             } else {
                 if (!PPM->isVbusIn()) {
-                    LOG_DEBUG("BQ27220 time to empty: %d min (%d mAh)", bq->getTimeToEmpty(), bq->getRemainingCapacity());
+                    LOG_TRACE("BQ27220 time to empty: %d min (%d mAh)", bq->getTimeToEmpty(), bq->getRemainingCapacity());
                 }
             }
         }

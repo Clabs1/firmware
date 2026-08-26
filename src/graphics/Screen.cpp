@@ -657,6 +657,10 @@ Screen::Screen(ScanI2C::DeviceAddress address, meshtastic_Config_DisplayConfig_O
 Screen::~Screen()
 {
     delete[] graphics::normalFrames;
+    // Owned by the constructor; Screen is genuinely destroyed on the portduino reboot path
+    // (screen = nullptr in Power.cpp), which previously leaked the display and UI objects.
+    delete ui;
+    delete dispdev;
 }
 
 /**
@@ -682,12 +686,13 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
         if (on) {
             LOG_INFO("Turn on screen");
             powerMon->setState(meshtastic_PowerMon_State_Screen_On);
-#ifdef T_WATCH_S3
-            PMU->enablePowerOutput(XPOWERS_ALDO2);
+#if defined(T_WATCH_S3) || defined(T_WATCH_ULTRA)
+            if (PMU) // cleared when both AXP init attempts failed
+                PMU->enablePowerOutput(XPOWERS_ALDO2);
 #endif
 
 // some screens seem to need a kick in the pants to turn back on
-#if defined(MUZI_BASE) || defined(M5STACK_CARDPUTER_ADV)
+#if defined(MUZI_BASE) || defined(M5STACK_CARDPUTER_ADV) || defined(TFT_RESET_AFTER_SLEEP)
             dispdev->init();
             dispdev->setBrightness(brightness);
             dispdev->flipScreenVertically();
@@ -706,14 +711,8 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
             dispdev->displayOn();
 #endif
 
-#if HAS_PWM_BACKLIGHT
+#if HAS_BACKLIGHT
             graphics::backlightOn();
-#elif defined(PIN_EINK_EN)
-            if (uiconfig.screen_brightness == 1)
-                digitalWrite(PIN_EINK_EN, HIGH);
-#elif defined(PCA_PIN_EINK_EN)
-            if (uiconfig.screen_brightness > 0)
-                io.digitalWrite(PCA_PIN_EINK_EN, HIGH);
 #endif
 
 #if defined(ST7789_CS) &&                                                                                                        \
@@ -772,12 +771,8 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
             drawLockdownLockScreen(dispdev);
 #endif
 
-#if HAS_PWM_BACKLIGHT
+#if HAS_BACKLIGHT
             graphics::backlightOff();
-#elif defined(PIN_EINK_EN)
-            digitalWrite(PIN_EINK_EN, LOW);
-#elif defined(PCA_PIN_EINK_EN)
-            io.digitalWrite(PCA_PIN_EINK_EN, LOW);
 #endif
 
             dispdev->displayOff();
@@ -820,7 +815,7 @@ void Screen::handleSetOn(bool on, FrameCallback einkScreensaver)
 #endif
 #endif
 
-#ifdef T_WATCH_S3
+#if defined(T_WATCH_S3) // on T_WATCH_ULTRA, powering down this pin seems to goober the i2c bus.
             PMU->disablePowerOutput(XPOWERS_ALDO2);
 #endif
             enabled = false;
@@ -834,6 +829,11 @@ void Screen::setup()
 
     // Enable display rendering
     useDisplay = true;
+
+#if HAS_BACKLIGHT
+    // Settles uiconfig.screen_brightness for GPIO backlights, so read it only after this
+    graphics::backlightInit();
+#endif
 
     // Load saved brightness from UI config
     // For OLED displays (SSD1306), default brightness is 255 if not set
@@ -1117,7 +1117,7 @@ int32_t Screen::runOnce()
     // Show boot screen for first logo_timeout seconds, then switch to normal operation.
     // serialSinceMsec adjusts for additional serial wait time during nRF52 bootup
     static bool showingBootScreen = true;
-    if (showingBootScreen && (millis() > (logo_timeout + serialSinceMsec))) {
+    if (showingBootScreen && Throttle::hasElapsed(serialSinceMsec, logo_timeout)) {
         LOG_INFO("Done with boot screen");
         stopBootScreen();
         showingBootScreen = false;
@@ -1125,8 +1125,8 @@ int32_t Screen::runOnce()
 
 #ifdef USERPREFS_OEM_TEXT
     static bool showingOEMBootScreen = true;
-    if (showingOEMBootScreen && (millis() > ((logo_timeout / 2) + serialSinceMsec))) {
-        LOG_INFO("Switch to OEM screen");
+    if (showingOEMBootScreen && Throttle::hasElapsed(serialSinceMsec, logo_timeout / 2)) {
+        LOG_INFO("Switch to OEM screen...");
         // Change frames.
         static FrameCallback bootOEMFrames[] = {graphics::UIRenderer::drawOEMBootScreen};
         static const int bootOEMFrameCount = sizeof(bootOEMFrames) / sizeof(bootOEMFrames[0]);

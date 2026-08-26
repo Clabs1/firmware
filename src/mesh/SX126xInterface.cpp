@@ -176,6 +176,12 @@ template <typename T> bool SX126xInterface<T>::init()
     if (res == RADIOLIB_ERR_NONE)
         res = lora.setCRC(RADIOLIB_SX126X_LORA_CRC_ON);
 
+#ifdef SX126X_NO_POWER_OPTIMIZATION_TABLE
+    // begin() applied the optimization table; re-apply the fixed PA config.
+    if (res == RADIOLIB_ERR_NONE)
+        res = lora.setOutputPower(power, false);
+#endif
+
     if (res == RADIOLIB_ERR_NONE)
         startReceive(); // start receiving
 
@@ -226,7 +232,11 @@ template <typename T> bool SX126xInterface<T>::reconfigure()
     if (power < -9)
         power = -9;
 
+#ifdef SX126X_NO_POWER_OPTIMIZATION_TABLE
+    err = lora.setOutputPower(power, false); // external PA: fixed PA config
+#else
     err = lora.setOutputPower(power);
+#endif
     if (err != RADIOLIB_ERR_NONE) {
         // Don't abort: this power is operator config (tx_power/SX126X_MAX_POWER); a value above the
         // driver's max would crash the daemon before reloadConfig() persists. Flag it and keep prior power.
@@ -336,7 +346,7 @@ template <typename T> void SX126xInterface<T>::addReceiveMetadata(meshtastic_Mes
     mp->rx_snr = lora.getSNR();
     mp->rx_rssi = lround(lora.getRSSI());
     mp->has_rx_rssi = true; // rx_rssi has explicit presence - a genuine reading must be marked present to survive encoding
-    LOG_DEBUG("Corrected frequency offset: %f", lora.getFrequencyError());
+    LOG_TRACE("Corrected frequency offset: %f", lora.getFrequencyError());
 }
 
 /** We override to turn on transmitter power as needed.

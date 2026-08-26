@@ -151,7 +151,7 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
             LOG_INFO("Ignore admin response from 0x%08x, no outstanding request", mp.from);
             return handled;
         }
-        LOG_DEBUG("Allow admin response message");
+        LOG_TRACE("Allow admin response message");
     } else if (mp.from == 0) {
         // Local admin from a BLE/USB/TCP client. from == 0 cannot arrive from the
         // mesh: RF drops packets without a sender (RadioLibInterface) and MQTT treats
@@ -1034,8 +1034,10 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c, bool fromOthers)
                 // If we're setting region for the first time, init the region and regenerate the keys
                 if (isRegionUnset && validatedLora.region > meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
 #if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
-                    if (crypto && !owner.is_licensed) {
-                        crypto->ensurePkiKeys(config.security, owner);
+                    // Minting the key moves our node num with it (my_node_num == crc32(public_key)), so
+                    // persist devicestate + the node DB too - exactly as the licensed branch below does.
+                    if (!owner.is_licensed && nodeDB->ensurePkiIdentity()) {
+                        changes |= SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE;
                     }
 #endif
                     // new region is valid and we're coming from an unset region, so enable tx
@@ -2168,7 +2170,7 @@ bool AdminModule::messageIsRequest(const meshtastic_AdminMessage *r)
 
 void AdminModule::handleSendInputEvent(const meshtastic_AdminMessage_InputEvent &inputEvent)
 {
-    LOG_DEBUG("Processing input event: event_code=%u, kb_char=%u, touch_x=%u, touch_y=%u", inputEvent.event_code,
+    LOG_TRACE("Processing input event: event_code=%u, kb_char=%u, touch_x=%u, touch_y=%u", inputEvent.event_code,
               inputEvent.kb_char, inputEvent.touch_x, inputEvent.touch_y);
 
     // Create InputEvent for injection.
