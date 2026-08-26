@@ -93,6 +93,10 @@
 // this long (one reporter policy; the tone still plays locally).
 #define FAMILYTRACKER_MISSED_SUPPRESS_MS (10 * 60 * 1000UL)
 
+// Base/relay mobility threshold: displacement from the boot anchor that counts
+// as "an adult picked the camp/car node up and is joining the search".
+#define FAMILYTRACKER_BASE_MOVE_METRES 150.0f
+
 // Panic state machine (ARCH §2). Minimum time between panic triggers on the
 // child (retrigger permitted after this cooldown, fresh event ID) and the
 // dedup window for the SAME (from, eventId) on a parent (mesh retransmissions
@@ -345,6 +349,8 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     // runOnce, so NO side-effect runs inside the radio RX handler. Doing banner/
     // buzzer/TX inside handleReceived contends with the radio/flash SPI lock on
     // the nRF52 and intermittently hangs the T1 parent.
+    // Ring buffer (BUG: single slot dropped child #2's alarm when two kids
+    // panicked within one runOnce tick). Guarded by stateLock.
     struct PendingPanic {
         bool active = false;
         NodeNum from = 0;
@@ -354,12 +360,25 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
         bool stale = false;
         uint8_t ageMin = 0;
         bool hasPos = false;
-    } pendingPanic;
+    };
+    static const uint8_t PENDING_PANIC_LEN = 6;
+    PendingPanic pendingPanics[PENDING_PANIC_LEN];
+    uint8_t pendingPanicHead = 0;   // next slot to WRITE
+    uint8_t pendingPanicCount = 0;  // waiting to render
+
+    // Serialises the RX-thread writers (handleReceived/handleTextCommand)
+    // against this module's OSThread reader (runOnce watchdog/drain) for:
+    // pendingPanics ring, lastPanicEventIdByNode, lastPanicAlertMsByNode,
+    // missedSuppressedUntilMs, alertQueue and lastPanicChild. std::map
+    // insert/find from two threads without a lock corrupts the heap - the
+    // exact failure class that got childLastSeenMs its own lock earlier.
+    mutable concurrency::Lock stateLock;
 
     // Deferred human-readable text: queueTextAlert() from the RX path must not
     // send directly (the reentrant flash save hangs the T1); flushed by runOnce.
     // BUG-017: ring buffer, not a single slot - rapid events (panic + regroup +
     // found) were overwriting each other before the flush, dropping messages.
+    // head/count are guarded by stateLock.
     void queueTextAlert(const char *format, ...);
     static const uint8_t ALERT_QUEUE_LEN = 6;
     char alertQueue[ALERT_QUEUE_LEN][128] = {{0}};
@@ -392,6 +411,25 @@ class FamilyTrackerModule : public SinglePortModule, public concurrency::OSThrea
     std::vector<NodeNum> pendingFavourites;
     std::vector<NodeNum> favouriteQueued;
     mutable concurrency::Lock favouriteLock;
+
+    // Remote-admin trust (family default): copy the public keys of PARENT-role
+    // family nodes into config.security.admin_key[0..2], so any parent can PKI-
+    // admin any other family node out of the box. Retried hourly-ish early on -
+    // the nodedb (and its public keys) fills as peers announce.
+    void syncAdminTrust();
+    uint8_t trustSyncAttempts = 0;
+    uint32_t lastTrustSyncMs = 0;
+
+    // Stationary base/relay mobility guard: a base-role node (camp / car) that
+    // moves > FAMILYTRACKER_BASE_MOVE_METRES from its boot anchor has been picked
+    // up by a searching adult - promote it to a full CLIENT parent (persisted +
+    // NodeInfo rebroadcast) so it joins alerts AND becomes a nearest-parent
+    // navigation target on the children's screens.
+    void updateBaseMobility();
+    bool baseAnchorSet = false;
+    int32_t baseAnchorLat = 0;
+    int32_t baseAnchorLon = 0;
+    bool mobilePromoted = false;
 };
 
 extern FamilyTrackerModule *familyTrackerModule;

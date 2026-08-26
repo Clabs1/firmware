@@ -63,8 +63,10 @@ bool FamilyTrackerModule::isParent() const
 
 bool FamilyTrackerModule::isBase() const
 {
-    return IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER,
-                     meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT);
+    // CLIENT_BASE is THE stationary camp/car role (app-visible). ROUTER /
+    // ROUTER_CLIENT stay recognised for older provisioned units.
+    return IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_CLIENT_BASE,
+                     meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT);
 }
 
 void FamilyTrackerModule::setup()
@@ -575,7 +577,7 @@ bool FamilyTrackerModule::handleFamilyCommand(const char *text)
                 lostDeclaredByUs.erase(target);
                 char still[96];
                 if (stillMissingNames(still, sizeof(still)))
-                    sendTextAlert("STILL MISSING: %s", still);
+                    queueTextAlert("STILL MISSING: %s", still); // deferred - same policy as every RX-path text
                 return true;
             }
             unknownChildError(name);
@@ -605,7 +607,7 @@ bool FamilyTrackerModule::handleFamilyCommand(const char *text)
         // "find <name>" - loud repeating tone on that node (dropped in grass).
         // Falls back to the whole nodedb so a base/car unit can chirp too.
         char name[32];
-        extractName(text + 5, name, sizeof(name));
+        extractName(text + 4, name, sizeof(name));
         if (name[0]) {
             NodeNum target = findChildByName(name);
             if (!target)
@@ -721,8 +723,10 @@ void FamilyTrackerModule::sendLostChild(NodeNum target)
     memcpy(p->decoded.payload.bytes, payload, sizeof(payload));
     service->sendToMesh(p, RX_SRC_LOCAL, true);
 
-    // Regroup: everyone comes back when a child is reported lost.
-    sendComeBack();
+    // Regroup: siblings come back when a child is reported lost. Silent datagram
+    // only - the "X is lost" announcement IS this event's chat narrative, so an
+    // extra "COME BACK:" text would double-report the same thing.
+    sendComeBackMsg(NODENUM_BROADCAST, false);
 
     const meshtastic_NodeInfoLite *c = nodeDB->getMeshNode(target);
     const char *cn = (c && c->long_name[0]) ? c->long_name : (c && c->short_name[0]) ? c->short_name : "Child";
@@ -763,13 +767,16 @@ void FamilyTrackerModule::queueTextAlert(const char *format, ...)
     // OLDEST entry so the freshest event always survives.
     va_list args;
     va_start(args, format);
-    vsnprintf(alertQueue[alertQueueHead], sizeof(alertQueue[0]), format, args);
+    {
+        concurrency::LockGuard guard(&stateLock);
+        vsnprintf(alertQueue[alertQueueHead], sizeof(alertQueue[0]), format, args);
+        alertQueueHead = (alertQueueHead + 1) % ALERT_QUEUE_LEN;
+        if (alertQueueCount < ALERT_QUEUE_LEN)
+            alertQueueCount++;
+        else
+            LOG_WARN("FamilyTracker: alert queue overflow (oldest text dropped)");
+    }
     va_end(args);
-    alertQueueHead = (alertQueueHead + 1) % ALERT_QUEUE_LEN;
-    if (alertQueueCount < ALERT_QUEUE_LEN)
-        alertQueueCount++;
-    else
-        LOG_WARN("FamilyTracker: alert queue overflow (oldest text dropped)");
 }
 
 #ifdef FAMILY_DEBUG_CHAT
@@ -923,7 +930,7 @@ ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacke
 
     // "find <name>" (phone text): locate a dropped node by sound
     if (matchCommand(buf, "find")) {
-        extractName(buf + 5, name, sizeof(name));
+        extractName(buf + 4, name, sizeof(name));
         if (!name[0]) {
             playErrorTone();
 #if HAS_SCREEN
@@ -952,7 +959,14 @@ ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacke
             // Extract the child name after the longest matching phrase, or fall
             // back to the most recently panicking child.
             NodeNum target = 0;
+            NodeNum lastPanic = 0;
             char nm[32] = {0};
+            {
+                // Locked snapshot of the RX-thread panic target (B3).
+                concurrency::LockGuard guard(&stateLock);
+                if (millis() - lastPanicChildMs < 300000)
+                    lastPanic = lastPanicChild;
+            }
             const char *phrases[] = {"calling for help", "calling help", "on my way",
                                      "coming now", "coming", "stay put", "stay where"};
             for (const char *ph : phrases) {
@@ -966,8 +980,8 @@ ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacke
                 target = findChildByName(nm);
             if (!target && nm[0])
                 target = findAnyNodeByName(nm);
-            if (!target && millis() - lastPanicChildMs < 300000)
-                target = lastPanicChild;
+            if (!target)
+                target = lastPanic;
             if (!target) {
                 playErrorTone();
                 if (authored) {
@@ -976,9 +990,12 @@ ProcessMessage FamilyTrackerModule::handleTextCommand(const meshtastic_MeshPacke
                 return ProcessMessage::STOP;
             }
             uint32_t eventId = 0;
-            auto it = lastPanicEventIdByNode.find(target);
-            if (it != lastPanicEventIdByNode.end())
-                eventId = it->second;
+            {
+                concurrency::LockGuard guard(&stateLock);
+                auto it = lastPanicEventIdByNode.find(target);
+                if (it != lastPanicEventIdByNode.end())
+                    eventId = it->second;
+            }
             sendOnWay(eventId, preset, target, authored);
             return ProcessMessage::STOP;
         }
@@ -1202,18 +1219,30 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                 // Queue the whole alert (banner + buzzer + ACK) for runOnce:
                 // doing it here inside the radio RX handler contends with the
                 // radio/flash SPI lock on the nRF52 and intermittently hangs.
-                pendingPanic.active = true;
-                pendingPanic.from = mp.from;
-                pendingPanic.eventId = eventId;
-                pendingPanic.eventTs = eventTs;
-                pendingPanic.pos = pos;
-                pendingPanic.stale = (flags & FAMILYTRACKER_FLAG_POS_STALE) != 0;
-                pendingPanic.ageMin = ageMin;
-                pendingPanic.hasPos = (flags & FAMILYTRACKER_FLAG_HAS_POS) != 0;
-                lastPanicChild = mp.from; // target for a quick unnamed "on my way"
-                lastPanicChildMs = nowMs;
+                // Ring slot (not single): two children panicking within one
+                // tick must BOTH alarm.
+                {
+                    concurrency::LockGuard guard(&stateLock);
+                    PendingPanic &slot = pendingPanics[pendingPanicHead];
+                    slot.active = true;
+                    slot.from = mp.from;
+                    slot.eventId = eventId;
+                    slot.eventTs = eventTs;
+                    slot.pos = pos;
+                    slot.stale = (flags & FAMILYTRACKER_FLAG_POS_STALE) != 0;
+                    slot.ageMin = ageMin;
+                    slot.hasPos = (flags & FAMILYTRACKER_FLAG_HAS_POS) != 0;
+                    pendingPanicHead = (pendingPanicHead + 1) % PENDING_PANIC_LEN;
+                    if (pendingPanicCount < PENDING_PANIC_LEN)
+                        pendingPanicCount++;
+                    else
+                        LOG_WARN("FamilyTracker: panic queue overflow (oldest dropped)");
+                    lastPanicChild = mp.from; // target for a quick unnamed "on my way"
+                    lastPanicChildMs = nowMs;
+                }
                 FT_DEBUG("panic rx event=%u from=0x%04x pos=%s%s", (unsigned)eventId, (unsigned)mp.from,
-                         pendingPanic.hasPos ? (pendingPanic.stale ? "stale" : "fresh") : "none",
+                         (flags & FAMILYTRACKER_FLAG_HAS_POS) ? ((flags & FAMILYTRACKER_FLAG_POS_STALE) ? "stale" : "fresh")
+                                                              : "none",
                          alreadyAlerted ? " dup" : "");
             } else {
                 FT_DEBUG("panic rx event=%u from=0x%04x DEDUPED", (unsigned)eventId, (unsigned)mp.from);
@@ -1373,13 +1402,17 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
                     playMarioMelody();
                     FT_DEBUG("lost mode ON (declared by 0x%04x)", (unsigned)mp.from);
                 }
-            }
-            if (screen)
+                // Announce ONCE per lost episode - re-declarations must not
+                // re-spam the group chat with "please help find me".
+                if (screen)
+                    screen->showSimpleBanner("Lost - come back now!", 15000);
+                char lost[64];
+                snprintf(lost, sizeof(lost), "%s is lost - please help find me", owner.short_name);
+                queueTextAlert("%s", lost); // deferred: RX-path text would re-enter the message store
+                LOG_WARN("FamilyTracker: LOST CHILD (me) - entering lost mode");
+            } else if (screen) {
                 screen->showSimpleBanner("Lost - come back now!", 15000);
-            char lost[64];
-            snprintf(lost, sizeof(lost), "%s is lost - please help find me", owner.short_name);
-            queueTextAlert("%s", lost); // deferred: RX-path text would re-enter the message store
-            LOG_WARN("FamilyTracker: LOST CHILD (me) - entering lost mode");
+            }
         } else if (isParent()) {
             const meshtastic_NodeInfoLite *c = nodeDB->getMeshNode(target);
             const char *cn = "Child";
@@ -1467,6 +1500,7 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
             target = (uint32_t)b[12] | ((uint32_t)b[13] << 8) | ((uint32_t)b[14] << 16) | ((uint32_t)b[15] << 24);
         }
         if (isParent() && target && mp.from != nodeDB->getNodeNum()) {
+            concurrency::LockGuard guard(&stateLock);
             missedSuppressedUntilMs[target] = millis() + FAMILYTRACKER_MISSED_SUPPRESS_MS;
             LOG_INFO("FamilyTracker: MISSED_ALERT child=0x%08x from 0x%08x - suppressing own group report", target,
                      mp.from);
@@ -1498,6 +1532,90 @@ ProcessMessage FamilyTrackerModule::handleReceived(const meshtastic_MeshPacket &
 #else
     return ProcessMessage::STOP;
 #endif
+}
+
+// Stationary base mobility guard: a CLIENT_BASE node left at camp / in the car
+// stays a silent sentinel. If its GPS shows it moved FAMILYTRACKER_BASE_MOVE_
+// METRES from where it first got a fix, an adult has picked it up to join the
+// search - promote it to a full CLIENT parent: persisted role change, NodeInfo
+// rebroadcast so every child's nodedb (and nearest-parent arrow) updates.
+void FamilyTrackerModule::updateBaseMobility()
+{
+    if (mobilePromoted || config.device.role != meshtastic_Config_DeviceConfig_Role_CLIENT_BASE)
+        return;
+
+    const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    if (!self || !nodeDB->hasValidPosition(self))
+        return; // no fix yet - keep waiting for the anchor
+
+    if (!baseAnchorSet) {
+        baseAnchorSet = true;
+        baseAnchorLat = localPosition.latitude_i;
+        baseAnchorLon = localPosition.longitude_i;
+        LOG_INFO("FamilyTracker: base anchor set (%.5f, %.5f)", baseAnchorLat * 1e-7, baseAnchorLon * 1e-7);
+        return;
+    }
+
+    float d = GeoCoord::latLongToMeter(baseAnchorLat * 1e-7, baseAnchorLon * 1e-7, localPosition.latitude_i * 1e-7,
+                                       localPosition.longitude_i * 1e-7);
+    if (d < FAMILYTRACKER_BASE_MOVE_METRES)
+        return;
+
+    // Picked up: become a full parent.
+    mobilePromoted = true;
+    config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
+    nodeDB->saveToDisk();
+    if (nodeInfoModule)
+        nodeInfoModule->sendOurNodeInfo(); // children re-role us in their nodedb
+    playStartMelody();                     // audible "I'm joining" cue for whoever grabbed it
+    LOG_WARN("FamilyTracker: base moved %.0f m - promoted to CLIENT parent", d);
+}
+
+// Family remote-admin default: copy each PARENT-role family node's public key
+// into our security.admin_key[0..2] so any parent can PKI-admin any family node
+// (children included) without manual key exchange. Children run this too - they
+// TRUST parents, which is exactly what lets parents admin them. Runs once at
+// startup on our own OSThread (flash save), never in the RX path.
+void FamilyTrackerModule::syncAdminTrust()
+{
+    size_t added = 0;
+    size_t count = nodeDB->getNumMeshNodes();
+    for (size_t i = 0; i < count && added < 3; i++) {
+        const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+        if (!n || n->num == nodeDB->getNodeNum())
+            continue;
+        // Only parent-ish roles are trusted admins (never trackers).
+        bool isParentRole =
+            IS_ONE_OF(n->role, meshtastic_Config_DeviceConfig_Role_CLIENT, meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE,
+                      meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT,
+                      meshtastic_Config_DeviceConfig_Role_CLIENT_BASE, meshtastic_Config_DeviceConfig_Role_ROUTER_LATE);
+        if (!isParentRole)
+            continue;
+        if (n->public_key.size != 32)
+            continue; // no PKI key exchanged yet
+
+        bool alreadyTrusted = false;
+        int freeSlot = -1;
+        for (int s = 0; s < 3; s++) {
+            if (config.security.admin_key[s].size == 32 &&
+                memcmp(config.security.admin_key[s].bytes, n->public_key.bytes, 32) == 0) {
+                alreadyTrusted = true;
+                break;
+            }
+            if (config.security.admin_key[s].size == 0 && freeSlot < 0)
+                freeSlot = s;
+        }
+        if (alreadyTrusted || freeSlot < 0)
+            continue;
+        memcpy(config.security.admin_key[freeSlot].bytes, n->public_key.bytes, 32);
+        config.security.admin_key[freeSlot].size = 32;
+        added++;
+        LOG_WARN("FamilyTracker: trusted admin key from family node 0x%08x", (unsigned)n->num);
+    }
+    if (added > 0) {
+        nodeDB->saveToDisk(); // persist so trust survives reboots
+        LOG_WARN("FamilyTracker: %u family admin keys saved", (unsigned)added);
+    }
 }
 
 int FamilyTrackerModule::handleInputEvent(const InputEvent *event)
@@ -1540,24 +1658,47 @@ int32_t FamilyTrackerModule::runOnce()
     // Act on a queued panic OUTSIDE the radio RX path: banner + buzzer + ACK.
     // None of these side-effects run inside handleReceived(), which is what
     // hangs the T1 parent.
-    if (pendingPanic.active) {
-        pendingPanic.active = false;
-        renderPanicAlert(pendingPanic.from, pendingPanic.eventId, pendingPanic.eventTs, pendingPanic.pos,
-                         pendingPanic.stale, pendingPanic.ageMin, pendingPanic.hasPos);
+    for (;;) {
+        PendingPanic pp; // copy-out under lock, act on it lock-free
+        {
+            concurrency::LockGuard guard(&stateLock);
+            if (pendingPanicCount == 0)
+                break;
+            uint8_t tail = (pendingPanicHead + PENDING_PANIC_LEN - pendingPanicCount) % PENDING_PANIC_LEN;
+            pp = pendingPanics[tail];
+            pendingPanics[tail].active = false;
+            pendingPanicCount--;
+        }
+        renderPanicAlert(pp.from, pp.eventId, pp.eventTs, pp.pos, pp.stale, pp.ageMin, pp.hasPos);
         playPanicAlert(); // alert (distinct from the child's call)
-        FT_DEBUG("parent panic alarm event=%u from=0x%04x", (unsigned)pendingPanic.eventId, (unsigned)pendingPanic.from);
-        sendAck(pendingPanic.eventId, pendingPanic.from); // SPEC §34 — targeted ACK (multi-Child §18A)
+        FT_DEBUG("parent panic alarm event=%u from=0x%04x", (unsigned)pp.eventId, (unsigned)pp.from);
+        sendAck(pp.eventId, pp.from); // SPEC §34 — targeted ACK (multi-Child §18A)
         return 200;
     }
 
     // Flush deferred family texts (queued by queueTextAlert from RX-path code
     // to avoid a reentrant message-store write that hangs the T1 parent).
-    while (alertQueueCount > 0) {
-        uint8_t tail = (alertQueueHead + ALERT_QUEUE_LEN - alertQueueCount) % ALERT_QUEUE_LEN;
+    for (;;) {
         char buf[sizeof(alertQueue[0])];
-        memcpy(buf, alertQueue[tail], sizeof(buf));
-        alertQueueCount--;
+        {
+            concurrency::LockGuard guard(&stateLock);
+            if (alertQueueCount == 0)
+                break;
+            uint8_t tail = (alertQueueHead + ALERT_QUEUE_LEN - alertQueueCount) % ALERT_QUEUE_LEN;
+            memcpy(buf, alertQueue[tail], sizeof(buf));
+            alertQueue[tail][0] = '\0';
+            alertQueueCount--;
+        }
         sendTextAlert("%s", buf);
+    }
+
+    // Family remote-admin trust sync: retried over the first ~10 min after boot
+    // (peers announce + exchange keys gradually); each retry only touches flash
+    // if new keys were actually merged. Cheap nodedb scan otherwise.
+    if (trustSyncAttempts < 10 && (lastTrustSyncMs == 0 || millis() - lastTrustSyncMs > 60000UL)) {
+        trustSyncAttempts++;
+        lastTrustSyncMs = millis();
+        syncAdminTrust();
     }
 
     // One-shot startup announce (BUG-011): broadcast a standard NodeInfo so
@@ -1724,9 +1865,14 @@ int32_t FamilyTrackerModule::runOnce()
 
     // Base/relay nodes don't run the parent watchdog: a silent sentinel that
     // only alerts on explicit PANIC/LOST CHILD, and must not duplicate the
-    // parents' MISSED CHECK-IN broadcasts.
-    if (isBase())
-        return 5000;
+    // parents' MISSED CHECK-IN broadcasts. A CLIENT_BASE that MOVES (adult
+    // picked it up) promotes itself to a full CLIENT parent first.
+    if (isBase()) {
+        updateBaseMobility();
+        if (!mobilePromoted)
+            return 5000;
+        LOG_INFO("FamilyTracker: promoted base now running full parent duties");
+    }
 
     uint32_t timeoutSecs = missedTimeoutSecs;
     uint8_t lowBatPct = lowBatteryPct;
@@ -1759,7 +1905,11 @@ int32_t FamilyTrackerModule::runOnce()
             // child's missed check-in, stay out of the group chat - the local
             // tone is our alert. Otherwise we report AND tell the other parents
             // to suppress their own texts (MISSED_ALERT datagram).
-            bool suppressed = ((int32_t)(missedSuppressedUntilMs[n->num] - millis()) > 0);
+            bool suppressed;
+            {
+                concurrency::LockGuard guard(&stateLock);
+                suppressed = ((int32_t)(missedSuppressedUntilMs[n->num] - millis()) > 0);
+            }
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
             if (!suppressed) {
                 sendTextAlert("MISSED CHECK-IN: %s missed check-in (%u s ago) - no contact", cn ? cn : "Child", age / 1000);
@@ -1776,7 +1926,10 @@ int32_t FamilyTrackerModule::runOnce()
                     memcpy(p->decoded.payload.bytes, payload, 16);
                     service->sendToMesh(p, RX_SRC_LOCAL, true);
                 }
-                missedSuppressedUntilMs[n->num] = millis() + FAMILYTRACKER_MISSED_SUPPRESS_MS;
+                {
+                    concurrency::LockGuard guard2(&stateLock);
+                    missedSuppressedUntilMs[n->num] = millis() + FAMILYTRACKER_MISSED_SUPPRESS_MS;
+                }
             }
             alertedMissed.push_back(n->num);
         } else if (!missed && wasMissed) {
@@ -1785,7 +1938,10 @@ int32_t FamilyTrackerModule::runOnce()
             const char *cn = (n->long_name[0]) ? n->long_name : n->short_name;
             sendTextAlert("CHECK-IN RESUMED: %s check-in resumed - contact restored", cn ? cn : "Child");
             alertedMissed.erase(std::remove(alertedMissed.begin(), alertedMissed.end(), n->num), alertedMissed.end());
-            missedSuppressedUntilMs.erase(n->num);
+            {
+                concurrency::LockGuard guard2(&stateLock);
+                missedSuppressedUntilMs.erase(n->num);
+            }
         }
 
         // Low battery from stored telemetry (SPEC §23/§24)
@@ -1829,9 +1985,16 @@ bool FamilyTrackerModule::getNearestParent(const char **name, float *distM, int 
         const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
         if (!n || n->num == nodeDB->getNodeNum())
             continue;
-        // Only parents (non-tracker roles) are navigation targets.
+        // Only parents (non-tracker roles) are navigation targets - EXCEPT
+        // stationary base nodes (CLIENT_BASE etc.): a camp relay shouldn't pull
+        // the kids' arrow away from the parent actually coming for them. Once
+        // the base is picked up it re-roles to CLIENT and its NodeInfo updates
+        // everyone's nodedb, so it appears here again automatically.
         if (n->role == meshtastic_Config_DeviceConfig_Role_TRACKER ||
             n->role == meshtastic_Config_DeviceConfig_Role_TAK_TRACKER)
+            continue;
+        if (IS_ONE_OF(n->role, meshtastic_Config_DeviceConfig_Role_CLIENT_BASE,
+                      meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT))
             continue;
         if (!nodeDB->hasValidPosition(n))
             continue;
